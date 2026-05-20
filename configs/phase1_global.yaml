@@ -1,0 +1,36 @@
+# configs/phase1_global.yaml
+# Phase 1: full-frame texture transfer — all tunable hyperparameters.
+# Nothing in src/ may hardcode a value that appears here.
+
+# ── Reproducibility ─────────────────────────────────────────────────────────
+seed: 42
+
+# ── Model identifiers (HuggingFace hub) ─────────────────────────────────────
+model_id: "runwayml/stable-diffusion-v1-5"
+controlnet_id: "lllyasviel/sd-controlnet-canny"
+
+# ── Input preprocessing ──────────────────────────────────────────────────────
+image_size: [256, 256]        # [width, height] applied to source image before encoding
+
+# ── Output ───────────────────────────────────────────────────────────────────
+experiments_root: "experiments"
+
+# ── Our method: PnP self-attention injection (TwoPassPipeline) ───────────────
+ours:
+  tau_f: 0.8                  # spatial-feature injection gate  (§4 Eq. 3; 0 < τ_f < 1)
+  tau_A: 0.5                  # self-attention injection gate   (§4 Eq. 4; 0 < τ_A < 1)
+  guidance_scale: 7.5
+  num_inference_steps: 50
+
+# ── SDEdit baseline ───────────────────────────────────────────────────────────
+sdedit:
+  strength: 0.6               # noise level: 0.0 = no edit, 1.0 = pure noise
+  guidance_scale: 7.5
+  num_inference_steps: 50
+
+# ── ControlNet baseline (Canny edges) ─────────────────────────────────────────
+controlnet:
+  canny_low: 100              # lower Canny threshold (applied to grayscale)
+  canny_high: 200             # upper Canny threshold
+  guidance_scale: 7.5
+  num_inference_steps: 50
