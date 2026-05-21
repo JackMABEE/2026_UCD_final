@@ -213,6 +213,13 @@ def main(argv=None) -> None:
     cfg = OmegaConf.load(args.config)
     logger.debug("Config loaded: {}", OmegaConf.to_yaml(cfg, resolve=True))
 
+    # 2a. Snapshot config for reproducibility (CLAUDE.md §8)
+    exp_dir = Path(cfg.experiments_root) / args.exp_name
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    config_snapshot = exp_dir / "config.yaml"
+    OmegaConf.save(cfg, config_snapshot)
+    logger.info("Config snapshot → {}", config_snapshot)
+
     # 3. Seed everything
     seed_everything(cfg.seed)
     logger.info("Seed set to {}", cfg.seed)

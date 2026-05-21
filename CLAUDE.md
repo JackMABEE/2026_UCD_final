@@ -194,11 +194,18 @@ papers/
 └── Tumanyan_Plug-and-Play_CVPR_2023.pdf      # PnP Diffusion Features — basis for attention_injection.py (Phase 1)
 ```
 
+Official source code:
+- PnP: https://github.com/MichalGeyer/plug-and-play
+- P2P: https://github.com/google/prompt-to-prompt
+
 Rules:
-- Read PnP before implementing `core/attention_injection.py`. Summarize §4 and get approval before coding.
-- Read P2P before implementing `core/mask_extraction.py`. Summarize §3.1–3.2 and get approval before coding.
-- ❌ Do not start either file without paper review and explicit approval.
+- Before implementing or modifying any file in `core/`, read BOTH the paper AND the official source code.
+- Cross-check implementation against both. Report discrepancies before writing any code.
+- Read PnP paper §4 + PnP source before touching `attention_injection.py` or `two_pass_pipeline.py`.
+- Read P2P paper §3.1–3.2 + P2P source before touching `mask_extraction.py`.
+- ❌ Never implement `core/` from paper description alone.
+- ❌ Do not start any `core/` file without paper + source review and explicit approval.
 
 ---
 
-*Last updated: 2026-05-19*
+*Last updated: 2026-05-20*

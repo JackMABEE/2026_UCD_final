@@ -10,13 +10,14 @@ inject_kv(ref_kv, gen_kv) -> torch.Tensor
 AttentionInjector(unet, tau_f, tau_A)
     Register forward hooks on UNet decoder blocks without touching weights.
     Gate: inject features when step / total_steps > tau_f,
-          inject self-attention when step / total_steps > tau_A.
+          inject Q/K when step / total_steps > tau_A.
     Thresholds tau_f / tau_A come from config (from_config); never hardcoded.
+    up_blocks[0] (coarsest) attention is intentionally excluded (D4).
 
 CapturedFeatures
     Populated during begin_ref_pass() / end_ref_pass() lifecycle:
-      .spatial_features   — f^4_t, shape (B, C, H, W), from one decoder resnet
-      .self_attentions    — {A^l_t}, one tensor per decoder self-attention layer
+      .spatial_features  — f^4_t, shape (B, C, H, W), from up_blocks[1].resnets[0]
+      .attn_qk           — [(Q_i, K_i)] for each attn1 in up_blocks[1..N]
 """
 
 from __future__ import annotations
@@ -222,8 +223,8 @@ class TestCapturedFeatures:
     def test_default_spatial_features_is_none(self):
         assert CapturedFeatures().spatial_features is None
 
-    def test_default_self_attentions_is_empty(self):
-        assert CapturedFeatures().self_attentions == []
+    def test_default_attn_qk_is_empty(self):
+        assert CapturedFeatures().attn_qk == []
 
     def test_is_a_dataclass(self):
         from dataclasses import is_dataclass
@@ -386,22 +387,23 @@ class TestRefPassCapture:
         assert caps.spatial_features is not None
         assert caps.spatial_features.shape[1] == _MockResNet._CH
 
-    def test_self_attentions_list_is_nonempty(self, injector, unet):
+    def test_attn_qk_list_is_nonempty(self, injector, unet):
         caps = _do_ref_pass(injector, unet)
-        assert len(caps.self_attentions) > 0
+        assert len(caps.attn_qk) > 0
 
-    def test_self_attention_count_equals_decoder_attention_layers(self, injector, unet):
+    def test_attn_qk_count_equals_non_coarsest_attention_layers(self, injector, unet):
         caps = _do_ref_pass(injector, unet)
-        # One attention module per up_block, one transformer_block each → one attn1 each
-        expected = sum(len(blk.attentions) for blk in unet.up_blocks)
-        assert len(caps.self_attentions) == expected
+        # up_blocks[0] is skipped (D4); count from up_blocks[1] onward
+        expected = sum(len(blk.attentions) for blk in list(unet.up_blocks)[1:])
+        assert len(caps.attn_qk) == expected
 
     def test_captured_tensors_are_detached_from_graph(self, injector, unet):
         caps = _do_ref_pass(injector, unet)
         assert caps.spatial_features is not None
         assert not caps.spatial_features.requires_grad
-        for a in caps.self_attentions:
-            assert not a.requires_grad
+        for q, k in caps.attn_qk:
+            assert not q.requires_grad
+            assert not k.requires_grad
 
     def test_second_capture_overwrites_first(self, injector, unet):
         """A new ref_pass replaces the previous capture — no accumulation."""
@@ -410,10 +412,11 @@ class TestRefPassCapture:
         assert caps1.spatial_features is not None and caps2.spatial_features is not None
         assert not torch.equal(caps1.spatial_features, caps2.spatial_features)
 
-    def test_captured_self_attentions_are_finite(self, injector, unet):
+    def test_captured_attn_qk_are_finite(self, injector, unet):
         caps = _do_ref_pass(injector, unet)
-        for i, a in enumerate(caps.self_attentions):
-            assert torch.isfinite(a).all(), f"self_attentions[{i}] contains NaN/Inf"
+        for i, (q, k) in enumerate(caps.attn_qk):
+            assert torch.isfinite(q).all(), f"attn_qk[{i}].Q contains NaN/Inf"
+            assert torch.isfinite(k).all(), f"attn_qk[{i}].K contains NaN/Inf"
 
 
 # ---------------------------------------------------------------------------

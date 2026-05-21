@@ -9,7 +9,13 @@ invariant explicit and robust.
 import pytest
 import torch
 
-from attn_texture.core.fft_blend import blend_latents, blend_latents_local
+from attn_texture.core.fft_blend import (
+    _lab_to_rgb,
+    _rgb_to_lab,
+    blend_latents,
+    blend_latents_lab,
+    blend_latents_local,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -1,13 +1,19 @@
 """Two-pass PnP diffusion pipeline for Phase 1 texture transfer.
 
-Orchestrates the full ref-pass / gen-pass denoising loop described in
-Tumanyan et al., CVPR 2023 §4:
+Orchestrates the full DDIM-inversion + ref-pass / gen-pass denoising loop
+described in Tumanyan et al., CVPR 2023 §4, cross-checked against the official
+implementation at github.com/MichalGeyer/plug-and-play:
 
-  For each DDIM step t:
+  Pre-loop — DDIM inversion (D2):
+    Run the source latent z_0 forward through ascending timesteps to produce a
+    source-consistent z_T.  This replaces the random add_noise approach so that
+    the ref-pass features at each timestep correspond to the actual source image.
+
+  For each DDIM step t (denoising, descending):
     1. Ref pass  — run UNet on z_ref with the source prompt;
-                   AttentionInjector captures f^4_t and {A^l_t}.
+                   AttentionInjector captures f^4_t and {Q^l_t, K^l_t}.
     2. Gen  pass — run UNet on z_gen with the target prompt;
-                   AttentionInjector injects captured features (gated by τ_f / τ_A).
+                   AttentionInjector injects Q/K (gated by τ_f / τ_A).
 
 All model components are injected — this class never loads weights itself.
 device / dtype come from utils/device.py; τ values come from OmegaConf config.
@@ -22,6 +28,7 @@ from omegaconf import DictConfig
 from PIL import Image
 
 from attn_texture.core.attention_injection import AttentionInjector
+from attn_texture.core.fft_blend import blend_latents
 from attn_texture.utils.device import get_device_and_dtype, safe_to
 from attn_texture.utils.io import pil_to_tensor, tensor_to_pil
 
@@ -59,17 +66,19 @@ class TwoPassPipeline:
         self._vae_scale: float = float(vae.config.scaling_factor)
 
         self.guidance_scale: float = float(cfg.guidance_scale)
+        self.fft_cutoff_ratio: float = float(cfg.fft_cutoff_ratio)
 
         self.injector = AttentionInjector.from_config(unet, cfg)
         self.injector.register_hooks()
 
         logger.debug(
-            "TwoPassPipeline: device={} dtype={} tau_f={} tau_A={} guidance_scale={}",
+            "TwoPassPipeline: device={} dtype={} tau_f={} tau_A={} guidance_scale={} fft_cutoff={}",
             self._device,
             self._dtype,
             self.injector.tau_f,
             self.injector.tau_A,
             self.guidance_scale,
+            self.fft_cutoff_ratio,
         )
 
     # ------------------------------------------------------------------
@@ -107,13 +116,13 @@ class TwoPassPipeline:
             ref_embeds = self._encode_prompt(ref_prompt)
             gen_embeds = self._encode_prompt(gen_prompt)
 
-            # 3. Initialise noisy latents z_T from the VAE latent
+            # 3. Build source-consistent z_T via DDIM inversion (D2)
+            #    set_timesteps once here; _ddim_inversion reuses scheduler.timesteps.
             self.scheduler.set_timesteps(num_inference_steps)
             timesteps = self.scheduler.timesteps
             total_steps: int = int(self.scheduler.config.num_train_timesteps)
 
-            noise = torch.randn_like(z_0)
-            z_T = self.scheduler.add_noise(z_0, noise, timesteps[:1])
+            z_T = self._ddim_inversion(z_0, ref_embeds)
             ref_latents = z_T.clone()
             gen_latents = z_T.clone()
 
@@ -153,14 +162,60 @@ class TwoPassPipeline:
                 )
                 gen_latents = self.scheduler.step(gen_noise_pred, t, gen_latents).prev_sample
 
-            # 5. Decode gen latent → PIL image
-            decoded = self.vae.decode(gen_latents / self._vae_scale).sample  # (1, 3, H, W)
+            # 5. FFT blend: inject source low-freq lighting into the gen latent  # § 3.2 Eq.(1)
+            gen_latents = blend_latents(
+                src=z_0,
+                gen=gen_latents,
+                cutoff_ratio=self.fft_cutoff_ratio,
+            )
+
+            # 6. Decode gen latent → PIL image
+            decoded = self.vae.decode(gen_latents / self._vae_scale).sample  # (1, 3, H, W) in ~[-1, 1]
+            decoded = decoded / 2.0 + 0.5  # remap to [0, 1] — matches VaeImageProcessor.postprocess
 
         return tensor_to_pil(decoded[0].float())
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _ddim_inversion(
+        self,
+        z_0: torch.Tensor,
+        ref_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        """Deterministic DDIM forward process: z_0 → z_T.  (PnP § 4, D2 fix)
+
+        Runs the UNet in ascending timestep order (low noise → high noise) so
+        that z_T is source-consistent.  scheduler.set_timesteps() must have
+        been called before this method.
+
+        Args:
+            z_0:        VAE-encoded source latent, shape (1, 4, H, W).
+            ref_embeds: text embeddings for the source prompt, shape (1, S, D).
+
+        Returns:
+            Inverted latent z_T, same shape as z_0.
+        """
+        # Flip the denoising schedule to get ascending timesteps for inversion
+        timesteps_fwd = self.scheduler.timesteps.flip(0)
+        alphas: torch.Tensor = self.scheduler.alphas_cumprod.to(z_0.device, z_0.dtype)
+
+        z = z_0.clone()
+        for i, t in enumerate(timesteps_fwd):
+            alpha_t = alphas[t]
+            noise_pred = self.unet(z, t, encoder_hidden_states=ref_embeds).sample
+            # Predict clean latent from current noisy one  # § DDIM Eq.(9) reversed
+            z_0_pred = (z - (1.0 - alpha_t).sqrt() * noise_pred) / alpha_t.sqrt()
+            # Step to next (higher-noise) timestep
+            if i + 1 < len(timesteps_fwd):
+                alpha_next = alphas[timesteps_fwd[i + 1]]
+            else:
+                alpha_next = torch.zeros_like(alpha_t)
+            z = alpha_next.sqrt() * z_0_pred + (1.0 - alpha_next).sqrt() * noise_pred
+
+        logger.debug("TwoPassPipeline: DDIM inversion complete, z_T shape={}", z.shape)
+        return z
 
     def _encode_prompt(self, prompt: str) -> torch.Tensor:
         """Tokenize *prompt* and return text encoder hidden states.

@@ -167,7 +167,8 @@ class SDEditRunner:
 
         # 6. Decode → PIL
         with torch.inference_mode():
-            decoded = comps.vae.decode(latents / self._vae_scale).sample  # (1, 3, H, W)
+            decoded = comps.vae.decode(latents / self._vae_scale).sample  # (1, 3, H, W) in ~[-1, 1]
+            decoded = decoded / 2.0 + 0.5  # remap to [0, 1] — matches VaeImageProcessor.postprocess
         return tensor_to_pil(decoded[0].float())
 
     def _encode_prompt(self, comps: _Components, prompt: str) -> torch.Tensor:

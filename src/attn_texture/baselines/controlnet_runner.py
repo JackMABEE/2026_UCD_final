@@ -188,7 +188,8 @@ class ControlNetRunner:
                 latents = comps.scheduler.step(noise_pred, t, latents).prev_sample
 
             # 6. Decode → PIL
-            decoded = comps.vae.decode(latents / self._vae_scale).sample  # (1, 3, H, W)
+            decoded = comps.vae.decode(latents / self._vae_scale).sample  # (1, 3, H, W) in ~[-1, 1]
+            decoded = decoded / 2.0 + 0.5  # remap to [0, 1] — matches VaeImageProcessor.postprocess
         return tensor_to_pil(decoded[0].float())
 
     def _canny_condition(

@@ -167,10 +167,13 @@ class _StepResult:
 
 
 class _MockScheduler:
-    """Minimal DDIM scheduler stub."""
+    """Minimal DDIM scheduler stub with alphas_cumprod for DDIM inversion (D2)."""
 
     class config:
         num_train_timesteps: int = 1000
+
+    # Constant alpha so inversion math is stable (no division by zero)
+    alphas_cumprod: torch.Tensor = torch.ones(1000) * 0.5
 
     def __init__(self) -> None:
         self.timesteps: torch.Tensor = torch.tensor([])
@@ -242,7 +245,7 @@ def text_encoder() -> _MockTextEncoder:
 
 @pytest.fixture()
 def cfg():
-    return OmegaConf.create({"tau_f": 0.8, "tau_A": 0.5, "guidance_scale": 7.5})
+    return OmegaConf.create({"tau_f": 0.8, "tau_A": 0.5, "guidance_scale": 7.5, "fft_cutoff_ratio": 0.25})
 
 
 @pytest.fixture()
@@ -292,13 +295,15 @@ class TestPipelineConstruction:
         assert pipeline.injector.tau_A == pytest.approx(0.5)
 
     def test_hooks_registered_at_construction(self, pipeline):
-        # 1 feature hook + 3 attn1 hooks (3 up_blocks × 1 attn each)
-        assert len(pipeline.injector._hook_handles) == 4
+        # 1 feature hook + 2 q/k hook pairs for up_blocks[1] and up_blocks[2]
+        # (up_blocks[0] skipped per D4; 3 up_blocks total, each 1 attn1)
+        # = 1 + 2*2 = 5
+        assert len(pipeline.injector._hook_handles) == 5
 
     def test_custom_tau_respected(self, unet, vae, scheduler, tokenizer, text_encoder):
         from attn_texture.core.two_pass_pipeline import TwoPassPipeline
 
-        cfg = OmegaConf.create({"tau_f": 0.3, "tau_A": 0.6, "guidance_scale": 7.5})
+        cfg = OmegaConf.create({"tau_f": 0.3, "tau_A": 0.6, "guidance_scale": 7.5, "fft_cutoff_ratio": 0.25})
         p = TwoPassPipeline(unet, vae, scheduler, tokenizer, text_encoder, cfg)
         assert p.injector.tau_f == pytest.approx(0.3)
         assert p.injector.tau_A == pytest.approx(0.6)
@@ -375,10 +380,10 @@ class TestSchedulerInteraction:
         _run(pipeline, source_image)
         assert scheduler.step.call_count == 2 * _NUM_STEPS
 
-    def test_add_noise_called(self, pipeline, scheduler, source_image):
-        """Latents must be initialised from noise via the scheduler."""
+    def test_add_noise_not_called(self, pipeline, scheduler, source_image):
+        """z_T must come from DDIM inversion (D2), not random noise addition."""
         _run(pipeline, source_image)
-        assert scheduler.add_noise.call_count >= 1
+        assert scheduler.add_noise.call_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -482,12 +487,69 @@ class TestRefPassCapture:
         _run(pipeline, source_image)
         assert pipeline.injector.captured.spatial_features is not None
 
-    def test_self_attentions_populated_after_run(self, pipeline, source_image):
+    def test_attn_qk_populated_after_run(self, pipeline, source_image):
         _run(pipeline, source_image)
-        assert len(pipeline.injector.captured.self_attentions) > 0
+        assert len(pipeline.injector.captured.attn_qk) > 0
 
     def test_spatial_features_is_4d_tensor(self, pipeline, source_image):
         _run(pipeline, source_image)
         sf = pipeline.injector.captured.spatial_features
         assert sf is not None
         assert sf.ndim == 4  # (B, C, H, W)
+
+
+# ---------------------------------------------------------------------------
+# TestFFTBlend
+# ---------------------------------------------------------------------------
+
+
+class TestFFTBlend:
+    """FFT blend is wired in after the denoising loop with the config cutoff."""
+
+    def test_fft_cutoff_ratio_from_config(self, pipeline):
+        assert pipeline.fft_cutoff_ratio == pytest.approx(0.25)
+
+    def test_fft_cutoff_zero_respected(self, unet, vae, scheduler, tokenizer, text_encoder):
+        """cutoff=0 short-circuits to pure gen — blend_latents still called once."""
+        from attn_texture.core.two_pass_pipeline import TwoPassPipeline
+
+        cfg = OmegaConf.create({"tau_f": 0.8, "tau_A": 0.5, "guidance_scale": 7.5, "fft_cutoff_ratio": 0.0})
+        p = TwoPassPipeline(unet, vae, scheduler, tokenizer, text_encoder, cfg)
+        assert p.fft_cutoff_ratio == pytest.approx(0.0)
+
+    def test_blend_latents_called_once(self, pipeline, source_image):
+        """blend_latents must be invoked exactly once per run(), after the loop."""
+        from unittest.mock import patch, MagicMock
+        import torch
+
+        sentinel = MagicMock(return_value=torch.zeros(1, 4, 4, 4))
+        with patch("attn_texture.core.two_pass_pipeline.blend_latents", sentinel):
+            _run(pipeline, source_image)
+
+        assert sentinel.call_count == 1
+
+    def test_blend_receives_correct_cutoff(self, pipeline, source_image):
+        """The cutoff_ratio passed to blend_latents must match pipeline.fft_cutoff_ratio."""
+        from unittest.mock import patch, MagicMock
+        import torch
+
+        sentinel = MagicMock(return_value=torch.zeros(1, 4, 4, 4))
+        with patch("attn_texture.core.two_pass_pipeline.blend_latents", sentinel):
+            _run(pipeline, source_image)
+
+        kwargs = sentinel.call_args.kwargs
+        assert kwargs["cutoff_ratio"] == pytest.approx(pipeline.fft_cutoff_ratio)
+
+    def test_blend_receives_4d_src_and_gen(self, pipeline, source_image):
+        """src and gen passed to blend_latents must both be 4-D latent tensors."""
+        from unittest.mock import patch, MagicMock
+        import torch
+
+        sentinel = MagicMock(return_value=torch.zeros(1, 4, 4, 4))
+        with patch("attn_texture.core.two_pass_pipeline.blend_latents", sentinel):
+            _run(pipeline, source_image)
+
+        # blend_latents is called with keyword args
+        kwargs = sentinel.call_args.kwargs
+        assert kwargs["src"].ndim == 4
+        assert kwargs["gen"].ndim == 4
