@@ -504,52 +504,49 @@ class TestRefPassCapture:
 
 
 class TestFFTBlend:
-    """FFT blend is wired in after the denoising loop with the config cutoff."""
+    """blend_images_lab is wired in after VAE decode with the config cutoff."""
 
     def test_fft_cutoff_ratio_from_config(self, pipeline):
         assert pipeline.fft_cutoff_ratio == pytest.approx(0.25)
 
     def test_fft_cutoff_zero_respected(self, unet, vae, scheduler, tokenizer, text_encoder):
-        """cutoff=0 short-circuits to pure gen — blend_latents still called once."""
+        """cutoff=0 short-circuits to gen luminance — pipeline still runs."""
         from attn_texture.core.two_pass_pipeline import TwoPassPipeline
 
         cfg = OmegaConf.create({"tau_f": 0.8, "tau_A": 0.5, "guidance_scale": 7.5, "fft_cutoff_ratio": 0.0})
         p = TwoPassPipeline(unet, vae, scheduler, tokenizer, text_encoder, cfg)
         assert p.fft_cutoff_ratio == pytest.approx(0.0)
 
-    def test_blend_latents_called_once(self, pipeline, source_image):
-        """blend_latents must be invoked exactly once per run(), after the loop."""
+    def test_blend_images_lab_called_once(self, pipeline, source_image):
+        """blend_images_lab must be invoked exactly once per run(), after VAE decode."""
         from unittest.mock import patch, MagicMock
-        import torch
 
-        sentinel = MagicMock(return_value=torch.zeros(1, 4, 4, 4))
-        with patch("attn_texture.core.two_pass_pipeline.blend_latents", sentinel):
+        sentinel = MagicMock(side_effect=lambda src, gen, cutoff_ratio: gen)
+        with patch("attn_texture.core.two_pass_pipeline.blend_images_lab", sentinel):
             _run(pipeline, source_image)
 
         assert sentinel.call_count == 1
 
     def test_blend_receives_correct_cutoff(self, pipeline, source_image):
-        """The cutoff_ratio passed to blend_latents must match pipeline.fft_cutoff_ratio."""
+        """The cutoff_ratio passed to blend_images_lab must match pipeline.fft_cutoff_ratio."""
         from unittest.mock import patch, MagicMock
-        import torch
 
-        sentinel = MagicMock(return_value=torch.zeros(1, 4, 4, 4))
-        with patch("attn_texture.core.two_pass_pipeline.blend_latents", sentinel):
+        sentinel = MagicMock(side_effect=lambda src, gen, cutoff_ratio: gen)
+        with patch("attn_texture.core.two_pass_pipeline.blend_images_lab", sentinel):
             _run(pipeline, source_image)
 
-        kwargs = sentinel.call_args.kwargs
-        assert kwargs["cutoff_ratio"] == pytest.approx(pipeline.fft_cutoff_ratio)
+        assert sentinel.call_args.kwargs["cutoff_ratio"] == pytest.approx(pipeline.fft_cutoff_ratio)
 
-    def test_blend_receives_4d_src_and_gen(self, pipeline, source_image):
-        """src and gen passed to blend_latents must both be 4-D latent tensors."""
+    def test_blend_receives_3channel_src_and_gen(self, pipeline, source_image):
+        """src and gen passed to blend_images_lab must be 3-channel pixel tensors (not latents)."""
         from unittest.mock import patch, MagicMock
-        import torch
 
-        sentinel = MagicMock(return_value=torch.zeros(1, 4, 4, 4))
-        with patch("attn_texture.core.two_pass_pipeline.blend_latents", sentinel):
+        sentinel = MagicMock(side_effect=lambda src, gen, cutoff_ratio: gen)
+        with patch("attn_texture.core.two_pass_pipeline.blend_images_lab", sentinel):
             _run(pipeline, source_image)
 
-        # blend_latents is called with keyword args
         kwargs = sentinel.call_args.kwargs
         assert kwargs["src"].ndim == 4
+        assert kwargs["src"].shape[1] == 3   # RGB, not 4-ch latent
         assert kwargs["gen"].ndim == 4
+        assert kwargs["gen"].shape[1] == 3   # RGB, not 4-ch latent

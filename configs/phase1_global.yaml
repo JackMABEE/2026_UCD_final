@@ -21,7 +21,7 @@ ours:
   tau_A: 0.5                  # self-attention injection gate   (§4 Eq. 4; 0 < τ_A < 1)
   guidance_scale: 7.5
   num_inference_steps: 50
-  fft_cutoff_ratio: 0.25      # low-freq radius for FFT lighting blend (0=pure gen, 1=pure src)
+  fft_cutoff_ratio: 0.10      # low-freq radius for FFT lighting blend (0=pure gen, 1=pure src)
 
 # ── SDEdit baseline ───────────────────────────────────────────────────────────
 sdedit:

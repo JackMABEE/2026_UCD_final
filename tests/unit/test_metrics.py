@@ -15,12 +15,14 @@ All three raise ValueError when image spatial dimensions differ.
 from __future__ import annotations
 
 import math
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+import torch
 from PIL import Image
 
-from attn_texture.eval.metrics import lpips_score, psnr, ssim
+from attn_texture.eval.metrics import clip_score, dino_distance, lpips_score, psnr, ssim
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -148,3 +150,148 @@ class TestLpipsScore:
         b = Image.new("RGB", (_W * 2, _H * 2))
         with pytest.raises(ValueError):
             lpips_score(a, b)
+
+
+# ---------------------------------------------------------------------------
+# TestClipScore
+# ---------------------------------------------------------------------------
+
+
+class TestClipScore:
+    """clip_score(image, prompt) — CLIP cosine similarity, mocked for speed."""
+
+    _EMBED_DIM = 4
+
+    @pytest.fixture(autouse=True)
+    def inject_clip(self):
+        """Inject stub CLIP model/processor into module globals; restore after."""
+        import attn_texture.eval.metrics as _m
+
+        mock_proc = MagicMock()
+        mock_proc.return_value = {
+            "pixel_values": torch.zeros(1, 3, 224, 224),
+            "input_ids": torch.zeros(1, 10, dtype=torch.long),
+            "attention_mask": torch.ones(1, 10, dtype=torch.long),
+        }
+        mock_model = MagicMock()
+        _aligned = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        mock_model.get_image_features.return_value = _aligned.clone()
+        mock_model.get_text_features.return_value = _aligned.clone()
+
+        old_model, old_proc = _m._clip_model, _m._clip_processor
+        _m._clip_model = mock_model
+        _m._clip_processor = mock_proc
+        yield mock_model, mock_proc
+        _m._clip_model = old_model
+        _m._clip_processor = old_proc
+
+    def test_returns_float(self):
+        assert isinstance(clip_score(_solid(128, 64, 32), "a photo"), float)
+
+    def test_in_valid_range(self):
+        result = clip_score(_solid(100, 100, 100), "a fabric texture")
+        assert -1.0 <= result <= 1.0 + 1e-6
+
+    def test_aligned_embeddings_return_one(self):
+        """Identical unit-vector image and text embeddings → cosine = 1.0."""
+        result = clip_score(_solid(200, 200, 200), "any prompt")
+        assert result == pytest.approx(1.0, abs=1e-4)
+
+    def test_orthogonal_embeddings_return_zero(self, inject_clip):
+        mock_model, _ = inject_clip
+        mock_model.get_image_features.return_value = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        mock_model.get_text_features.return_value = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+        result = clip_score(_solid(0, 0, 0), "orthogonal prompt")
+        assert result == pytest.approx(0.0, abs=1e-4)
+
+    def test_opposite_embeddings_return_minus_one(self, inject_clip):
+        mock_model, _ = inject_clip
+        mock_model.get_image_features.return_value = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        mock_model.get_text_features.return_value = torch.tensor([[-1.0, 0.0, 0.0, 0.0]])
+        result = clip_score(_solid(0, 0, 0), "opposite")
+        assert result == pytest.approx(-1.0, abs=1e-4)
+
+    def test_image_and_text_features_both_called(self, inject_clip):
+        mock_model, mock_proc = inject_clip
+        clip_score(_solid(100, 100, 100), "silk fabric")
+        mock_proc.assert_called_once()
+        mock_model.get_image_features.assert_called_once()
+        mock_model.get_text_features.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestDinoDistance
+# ---------------------------------------------------------------------------
+
+
+class TestDinoDistance:
+    """dino_distance(img_a, img_b) — DINO CLS-token distance, mocked for speed."""
+
+    _EMBED_DIM = 4
+    _SEQ_LEN = 5  # CLS + 4 patches
+
+    @staticmethod
+    def _cls_hidden(vec: list[float]) -> torch.Tensor:
+        """Build a (1, _SEQ_LEN, _EMBED_DIM) hidden-state tensor with CLS = vec."""
+        h = torch.zeros(1, 5, 4)
+        h[0, 0] = torch.tensor(vec)
+        return h
+
+    @pytest.fixture(autouse=True)
+    def inject_dino(self):
+        """Inject stub DINO model/extractor; restore after."""
+        import attn_texture.eval.metrics as _m
+
+        mock_ext = MagicMock()
+        mock_ext.return_value = {"pixel_values": torch.zeros(1, 3, 224, 224)}
+        mock_model = MagicMock()
+        # Default: both calls return the same CLS embedding → distance = 0
+        mock_model.return_value.last_hidden_state = self._cls_hidden([1.0, 0.0, 0.0, 0.0])
+
+        old_model, old_ext = _m._dino_model, _m._dino_extractor
+        _m._dino_model = mock_model
+        _m._dino_extractor = mock_ext
+        yield mock_model, mock_ext
+        _m._dino_model = old_model
+        _m._dino_extractor = old_ext
+
+    def test_returns_float(self):
+        assert isinstance(dino_distance(_solid(0, 0, 0), _solid(255, 255, 255)), float)
+
+    def test_non_negative(self):
+        result = dino_distance(_solid(100, 100, 100), _solid(200, 200, 200))
+        assert result >= 0.0
+
+    def test_identical_cls_tokens_return_zero(self):
+        """Same embedding from both calls → cosine = 1 → distance = 0."""
+        result = dino_distance(_solid(128, 128, 128), _solid(128, 128, 128))
+        assert result == pytest.approx(0.0, abs=1e-4)
+
+    def test_orthogonal_cls_tokens_return_one(self, inject_dino):
+        """Orthogonal embeddings → cosine = 0 → distance = 1."""
+        mock_model, _ = inject_dino
+        h_a = self._cls_hidden([1.0, 0.0, 0.0, 0.0])
+        h_b = self._cls_hidden([0.0, 1.0, 0.0, 0.0])
+        mock_model.side_effect = [
+            MagicMock(last_hidden_state=h_a),
+            MagicMock(last_hidden_state=h_b),
+        ]
+        result = dino_distance(_solid(0, 0, 0), _solid(255, 255, 255))
+        assert result == pytest.approx(1.0, abs=1e-4)
+
+    def test_opposite_cls_tokens_return_two(self, inject_dino):
+        """Anti-parallel embeddings → cosine = -1 → distance = 2."""
+        mock_model, _ = inject_dino
+        h_a = self._cls_hidden([1.0, 0.0, 0.0, 0.0])
+        h_b = self._cls_hidden([-1.0, 0.0, 0.0, 0.0])
+        mock_model.side_effect = [
+            MagicMock(last_hidden_state=h_a),
+            MagicMock(last_hidden_state=h_b),
+        ]
+        result = dino_distance(_solid(0, 0, 0), _solid(255, 255, 255))
+        assert result == pytest.approx(2.0, abs=1e-4)
+
+    def test_model_called_twice_once_per_image(self, inject_dino):
+        mock_model, _ = inject_dino
+        dino_distance(_solid(100, 100, 100), _solid(200, 200, 200))
+        assert mock_model.call_count == 2

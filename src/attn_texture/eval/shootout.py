@@ -1,15 +1,15 @@
-"""4-way comparison panel and metrics aggregation for Phase 1 shootout.
+"""5-way comparison panel and metrics aggregation for Phase 1 shootout.
 
-Accepts four PIL images (original, sdedit, controlnet, ours), stitches them
-into a side-by-side panel with burned-in labels, computes SSIM / PSNR / LPIPS
-for each method vs. the original, and writes two artefacts to the experiment
-directory:
+Accepts five PIL images (original, sdedit, controlnet, pnp_baseline, ours),
+stitches them into a side-by-side panel with burned-in labels, computes
+SSIM / PSNR / LPIPS for each method vs. the original, and writes two
+artefacts to the experiment directory:
 
-  experiments/<exp_name>/shootout.png   — 1×4 RGB panel
+  experiments/<exp_name>/shootout.png   — 1×5 RGB panel
   experiments/<exp_name>/metrics.json   — nested dict, one entry per method
 
 Domain naming follows CLAUDE.md §4:
-  method keys: "sdedit", "controlnet", "ours"  (never "sdEdit", "cnet", etc.)
+  method keys: "sdedit", "controlnet", "pnp_baseline", "ours"
 """
 
 from __future__ import annotations
@@ -21,9 +21,9 @@ from pathlib import Path
 from loguru import logger
 from PIL import Image, ImageDraw, ImageFont
 
-from attn_texture.eval.metrics import lpips_score, psnr, ssim
+from attn_texture.eval.metrics import clip_score, dino_distance, lpips_score, psnr, ssim
 
-_METHODS: tuple[str, ...] = ("original", "sdedit", "controlnet", "ours")
+_METHODS: tuple[str, ...] = ("original", "sdedit", "controlnet", "pnp_baseline", "ours")
 _LABEL_HEIGHT: int = 24  # pixel rows reserved for the text banner above each image
 _LABEL_FILL: tuple[int, int, int] = (255, 255, 255)
 _LABEL_BG: tuple[int, int, int] = (30, 30, 30)
@@ -35,10 +35,12 @@ def run_shootout(
     original: Image.Image,
     sdedit: Image.Image,
     controlnet: Image.Image,
+    pnp_baseline: Image.Image,
     ours: Image.Image,
+    gen_prompt: str,
     experiments_root: Path = Path("experiments"),
 ) -> dict[str, dict[str, float]]:
-    """Run the 4-way shootout: build panel, compute metrics, save artefacts.
+    """Run the 5-way shootout: build panel, compute metrics, save artefacts.
 
     Args:
         exp_name:          Experiment identifier, used as the subdirectory name
@@ -47,22 +49,26 @@ def run_shootout(
         original:          Source / reference image.
         sdedit:            SDEdit baseline output.
         controlnet:        ControlNet baseline output.
-        ours:              Our PnP attention-injection output.
+        pnp_baseline:      PnP attention-injection only (fft_cutoff_ratio=0).
+        ours:              PnP + LAB FFT blend (full method).
+        gen_prompt:        Target text prompt used during generation; passed to
+                           clip_score to measure image-text alignment.
         experiments_root:  Root directory for all experiment artefacts.
                            Defaults to ``experiments/`` in the working directory.
 
     Returns:
         Nested dict of the form::
 
-            {"sdedit":     {"ssim": …, "psnr": …, "lpips": …},
-             "controlnet": {"ssim": …, "psnr": …, "lpips": …},
-             "ours":       {"ssim": …, "psnr": …, "lpips": …}}
+            {"sdedit":        {"ssim": …, "psnr": …, "lpips": …, "clip": …, "dino": …},
+             "controlnet":    {…},
+             "pnp_baseline":  {…},
+             "ours":          {…}}
 
     Side effects:
         Writes ``shootout.png`` and ``metrics.json`` to
         ``experiments_root / exp_name``.
     """
-    images = [original, sdedit, controlnet, ours]
+    images = [original, sdedit, controlnet, pnp_baseline, ours]
 
     # 1. Build and save the panel
     panel = _build_panel(images, list(_METHODS))
@@ -73,18 +79,30 @@ def run_shootout(
     logger.info("Saved panel → {}", panel_path)
 
     # 2. Compute metrics for each non-original method vs. original
-    method_images = {"sdedit": sdedit, "controlnet": controlnet, "ours": ours}
+    method_images = {
+        "sdedit": sdedit,
+        "controlnet": controlnet,
+        "pnp_baseline": pnp_baseline,
+        "ours": ours,
+    }
     metrics: dict[str, dict[str, float]] = {}
     for method, img in method_images.items():
         s = ssim(original, img)
         p = psnr(original, img)
         lp = lpips_score(original, img)
+        cl = clip_score(img, gen_prompt)
+        di = dino_distance(original, img)
         metrics[method] = {
             "ssim": float(s),
             "psnr": _finite_or_cap(p),
             "lpips": float(lp),
+            "clip": float(cl),
+            "dino": float(di),
         }
-        logger.debug("{}: ssim={:.4f} psnr={:.2f} lpips={:.4f}", method, s, p, lp)
+        logger.debug(
+            "{}: ssim={:.4f} psnr={:.2f} lpips={:.4f} clip={:.4f} dino={:.4f}",
+            method, s, p, lp, cl, di,
+        )
 
     # 3. Save metrics JSON
     json_path = exp_dir / "metrics.json"

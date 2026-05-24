@@ -28,7 +28,7 @@ from omegaconf import DictConfig
 from PIL import Image
 
 from attn_texture.core.attention_injection import AttentionInjector
-from attn_texture.core.fft_blend import blend_latents
+from attn_texture.core.fft_blend import blend_images_lab
 from attn_texture.utils.device import get_device_and_dtype, safe_to
 from attn_texture.utils.io import pil_to_tensor, tensor_to_pil
 
@@ -107,8 +107,8 @@ class TwoPassPipeline:
 
         with torch.inference_mode():
             # 1. Encode source image to latent z_0  (B, 4, H/8, W/8)
-            pixel_tensor = pil_to_tensor(source_image).unsqueeze(0)  # (1, 3, H, W) float32 [0,1]
-            pixel_tensor = safe_to(pixel_tensor, device, dtype) * 2.0 - 1.0  # remap to [-1, 1]
+            src_pixels = pil_to_tensor(source_image).unsqueeze(0)  # (1, 3, H, W) float32 [0,1]
+            pixel_tensor = safe_to(src_pixels, device, dtype) * 2.0 - 1.0  # remap to [-1, 1]
             z_0 = self.vae.encode(pixel_tensor).latent_dist.sample() * self._vae_scale
 
             # 2. Encode prompts to text embeddings  (1, S, D)
@@ -162,18 +162,21 @@ class TwoPassPipeline:
                 )
                 gen_latents = self.scheduler.step(gen_noise_pred, t, gen_latents).prev_sample
 
-            # 5. FFT blend: inject source low-freq lighting into the gen latent  # § 3.2 Eq.(1)
-            gen_latents = blend_latents(
-                src=z_0,
-                gen=gen_latents,
+            # 5. Decode gen latent → pixel tensor [0, 1]
+            decoded = self.vae.decode(gen_latents / self._vae_scale).sample  # (1, 3, H, W) ~[-1, 1]
+            decoded = (decoded / 2.0 + 0.5).clamp(0.0, 1.0)
+
+            # 6. FFT-blend luminance only in LAB space  # § 3.2 Eq.(1)
+            #    Keeps source low-freq lighting (L channel) while gen's chroma (AB) is unchanged,
+            #    avoiding the colour washout that latent-space blending caused.
+            src_pix = safe_to(src_pixels, device, decoded.dtype)
+            blended = blend_images_lab(
+                src=src_pix,
+                gen=decoded,
                 cutoff_ratio=self.fft_cutoff_ratio,
             )
 
-            # 6. Decode gen latent → PIL image
-            decoded = self.vae.decode(gen_latents / self._vae_scale).sample  # (1, 3, H, W) in ~[-1, 1]
-            decoded = decoded / 2.0 + 0.5  # remap to [0, 1] — matches VaeImageProcessor.postprocess
-
-        return tensor_to_pil(decoded[0].float())
+        return tensor_to_pil(blended[0].float())
 
     # ------------------------------------------------------------------
     # Internal helpers

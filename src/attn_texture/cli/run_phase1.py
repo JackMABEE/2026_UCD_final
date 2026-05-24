@@ -104,6 +104,23 @@ def _load_controlnet_components(cfg):
 # ---------------------------------------------------------------------------
 
 
+def _run_pnp_baseline(cfg, source_image, ref_prompt: str, gen_prompt: str):
+    """PnP attention injection only — no FFT blend (fft_cutoff_ratio forced to 0)."""
+    logger.info("─── Running: pnp_baseline (TwoPassPipeline, no FFT) ───")
+    cfg_no_fft = OmegaConf.merge(cfg.ours, OmegaConf.create({"fft_cutoff_ratio": 0.0}))
+    with with_isolated_model(lambda: _load_sd_components(cfg)) as comps:
+        unet, vae, scheduler, tokenizer, text_encoder = comps
+        pipeline = TwoPassPipeline(unet, vae, scheduler, tokenizer, text_encoder, cfg_no_fft)
+        result = pipeline.run(
+            source_image=source_image,
+            ref_prompt=ref_prompt,
+            gen_prompt=gen_prompt,
+            num_inference_steps=cfg.ours.num_inference_steps,
+        )
+    logger.info("pnp_baseline: done.")
+    return result
+
+
 def _run_ours(cfg, source_image, ref_prompt: str, gen_prompt: str):
     logger.info("─── Running: ours (TwoPassPipeline) ───")
     with with_isolated_model(lambda: _load_sd_components(cfg)) as comps:
@@ -231,6 +248,7 @@ def main(argv=None) -> None:
 
     # 5. Run each method serially — memory freed between each (CLAUDE.md §5.2)
     img_ours = _run_ours(cfg, source_image, args.ref_prompt, args.gen_prompt)
+    img_pnp_baseline = _run_pnp_baseline(cfg, source_image, args.ref_prompt, args.gen_prompt)
     img_sdedit = _run_sdedit(cfg, source_image, args.gen_prompt)
     img_controlnet = _run_controlnet(cfg, source_image, args.gen_prompt)
 
@@ -241,7 +259,9 @@ def main(argv=None) -> None:
         original=source_image,
         sdedit=img_sdedit,
         controlnet=img_controlnet,
+        pnp_baseline=img_pnp_baseline,
         ours=img_ours,
+        gen_prompt=args.gen_prompt,
         experiments_root=Path(cfg.experiments_root),
     )
 
@@ -249,11 +269,13 @@ def main(argv=None) -> None:
     logger.info("Metrics summary:")
     for method, scores in metrics.items():
         logger.info(
-            "  {:12s}  SSIM={:.4f}  PSNR={:.2f}dB  LPIPS={:.4f}",
+            "  {:12s}  SSIM={:.4f}  PSNR={:.2f}dB  LPIPS={:.4f}  CLIP={:.4f}  DINO={:.4f}",
             method,
             scores["ssim"],
             scores["psnr"],
             scores["lpips"],
+            scores["clip"],
+            scores["dino"],
         )
 
     exp_dir = Path(cfg.experiments_root) / args.exp_name

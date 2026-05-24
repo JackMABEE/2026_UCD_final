@@ -1,28 +1,38 @@
 """Image quality metrics over PIL images.
 
-All three functions accept an (original, generated) pair of RGB PIL images
-and return a scalar float.  They are used by eval/shootout.py to compare
-each baseline/ours output against the source reference.
+All functions accept PIL images and return a scalar float.  Used by
+eval/shootout.py to compare each baseline/ours output against the reference.
 
 Implementations
 ---------------
-ssim        — scikit-image structural_similarity, channel_axis=2, data_range=255
-psnr        — scikit-image peak_signal_noise_ratio, data_range=255
-lpips_score — lpips.LPIPS(net="alex"); singleton loaded once per process
+ssim          — scikit-image structural_similarity, channel_axis=2, data_range=255
+psnr          — scikit-image peak_signal_noise_ratio, data_range=255
+lpips_score   — lpips.LPIPS(net="alex"); singleton loaded once per process
+clip_score    — openai/clip-vit-base-patch32 cosine similarity (image ↔ prompt)
+dino_distance — facebook/dino-vits8 CLS-token distance (1 − cosine_similarity)
 """
 
 from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from loguru import logger
 from PIL import Image
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+from transformers import AutoFeatureExtractor, AutoModel, CLIPModel, CLIPProcessor
 
 import lpips as _lpips_lib
 
-# Module-level singleton so the AlexNet weights are loaded only once.
+_CLIP_MODEL_ID = "openai/clip-vit-base-patch32"
+_DINO_MODEL_ID = "facebook/dino-vits8"
+
+# Module-level singletons — each model loads once per process.
 _lpips_model: "_lpips_lib.LPIPS | None" = None
+_clip_model: "CLIPModel | None" = None
+_clip_processor: "CLIPProcessor | None" = None
+_dino_model: "AutoModel | None" = None
+_dino_extractor: "AutoFeatureExtractor | None" = None
 
 
 def _get_lpips_model() -> "_lpips_lib.LPIPS":
@@ -32,6 +42,26 @@ def _get_lpips_model() -> "_lpips_lib.LPIPS":
         _lpips_model = _lpips_lib.LPIPS(net="alex", verbose=False)
         _lpips_model.eval()
     return _lpips_model
+
+
+def _get_clip() -> tuple["CLIPModel", "CLIPProcessor"]:
+    global _clip_model, _clip_processor
+    if _clip_model is None:
+        logger.debug("Loading CLIP {} (first call only)…", _CLIP_MODEL_ID)
+        _clip_processor = CLIPProcessor.from_pretrained(_CLIP_MODEL_ID)
+        _clip_model = CLIPModel.from_pretrained(_CLIP_MODEL_ID)
+        _clip_model.eval()
+    return _clip_model, _clip_processor
+
+
+def _get_dino() -> tuple["AutoModel", "AutoFeatureExtractor"]:
+    global _dino_model, _dino_extractor
+    if _dino_model is None:
+        logger.debug("Loading DINO {} (first call only)…", _DINO_MODEL_ID)
+        _dino_extractor = AutoFeatureExtractor.from_pretrained(_DINO_MODEL_ID)
+        _dino_model = AutoModel.from_pretrained(_DINO_MODEL_ID)
+        _dino_model.eval()
+    return _dino_model, _dino_extractor
 
 
 def _to_numpy_rgb(img: Image.Image) -> np.ndarray:
@@ -112,3 +142,60 @@ def lpips_score(img_a: Image.Image, img_b: Image.Image) -> float:
     with torch.no_grad():
         dist = model(a_t, b_t)
     return float(dist.item())
+
+
+def clip_score(image: Image.Image, prompt: str) -> float:
+    """CLIP cosine similarity between an image and a text prompt.
+
+    Measures how well the generated image matches the intended style/content
+    described by *prompt*. Uses openai/clip-vit-base-patch32.
+
+    Args:
+        image:  RGB PIL image to evaluate.
+        prompt: target text prompt (e.g. the gen_prompt used for generation).
+
+    Returns:
+        Cosine similarity ∈ [-1, 1]; higher = image better matches prompt.
+    """
+    model, processor = _get_clip()
+    inputs = processor(
+        text=[prompt],
+        images=image.convert("RGB"),
+        return_tensors="pt",
+        padding=True,
+    )
+    with torch.no_grad():
+        img_embeds = model.get_image_features(pixel_values=inputs["pixel_values"])
+        txt_embeds = model.get_text_features(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask"),
+        )
+    img_embeds = F.normalize(img_embeds, dim=-1)
+    txt_embeds = F.normalize(txt_embeds, dim=-1)
+    return float((img_embeds * txt_embeds).sum().item())
+
+
+def dino_distance(img_a: Image.Image, img_b: Image.Image) -> float:
+    """Structural distance between two images using DINO CLS-token features.
+
+    Extracts the [CLS] token from facebook/dino-vits8 for each image and
+    returns 1 − cosine_similarity. Lower = more structurally similar.
+    Matches the evaluation protocol in PnP Figure 9.
+
+    Args:
+        img_a: first RGB PIL image (typically the source / original).
+        img_b: second RGB PIL image (typically the generated output).
+
+    Returns:
+        Distance ∈ [0, 2]; 0 for structurally identical images.
+    """
+    model, extractor = _get_dino()
+    inputs_a = extractor(images=img_a.convert("RGB"), return_tensors="pt")
+    inputs_b = extractor(images=img_b.convert("RGB"), return_tensors="pt")
+    with torch.no_grad():
+        feat_a = model(**inputs_a).last_hidden_state[:, 0, :]  # CLS token
+        feat_b = model(**inputs_b).last_hidden_state[:, 0, :]
+    feat_a = F.normalize(feat_a, dim=-1)
+    feat_b = F.normalize(feat_b, dim=-1)
+    cos_sim = float((feat_a * feat_b).sum().item())
+    return float(1.0 - cos_sim)

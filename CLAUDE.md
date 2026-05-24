@@ -30,7 +30,7 @@ Two-phase research plan:
 | Baselines | `diffusers` SDEdit pipeline; `controlnet-aux` + ControlNet (Canny/HED) | comparison only |
 | Math | `torch.fft` preferred; `numpy` / `scipy` only for offline eval |
 | Imaging | `Pillow`, `opencv-python` |
-| Metrics | `scikit-image` (SSIM/PSNR), `lpips`, `torchmetrics` |
+| Metrics | `scikit-image` (SSIM/PSNR), `lpips`, `torchmetrics`, `transformers` (CLIP/DINO) |
 | Testing | `pytest`, `pytest-cov` | TDD enforced |
 | Config | `OmegaConf` or `pydantic` | no hardcoded hyperparams |
 | Logging | `loguru` | no `print` |
@@ -208,4 +208,13 @@ Rules:
 
 ---
 
-*Last updated: 2026-05-20*
+## 12. Implementation Notes
+
+**eval/metrics.py**
+- CLIP: `openai/clip-vit-base-patch32`, cosine similarity between image and prompt
+- DINO: `facebook/dino-vits8`, CLS token distance (lower = more similar structure)
+- These match PnP paper Figure 9 evaluation protocol
+
+---
+
+*Last updated: 2026-05-23*

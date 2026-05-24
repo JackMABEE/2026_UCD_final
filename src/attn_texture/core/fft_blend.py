@@ -6,8 +6,12 @@ stays on GPU/MPS via torch.fft — no NumPy on the hot path (CLAUDE.md §6 rule 
 
 Public API
 ----------
-blend_latents       — global blend, whole spatial extent
-blend_latents_local — blend only inside a spatial mask (Phase 2)
+blend_latents           — global blend in latent space, whole spatial extent
+blend_latents_local     — blend only inside a spatial mask (Phase 2)
+blend_images_lab        — pixel-space blend: L channel only, gen chroma preserved
+global_brightness_match — scalar L-channel brightness correction (no FFT)
+_rgb_to_lab             — sRGB → CIE LAB (exported for testing)
+_lab_to_rgb             — CIE LAB → sRGB (exported for testing)
 """
 
 from __future__ import annotations
@@ -124,6 +128,96 @@ def blend_latents(
     return torch.fft.ifftn(blended_fft, dim=(-2, -1)).real
 
 
+# ---------------------------------------------------------------------------
+# CIE LAB colour-space helpers
+# ---------------------------------------------------------------------------
+
+# D65 illuminant reference white (IEC 61966-2-1)
+_D65 = (0.9504559, 1.0000000, 1.0890578)
+
+# sRGB ↔ CIE XYZ matrices (IEC 61966-2-1 primaries, D65)
+_RGB_TO_XYZ = [
+    [0.4124564, 0.3575761, 0.1804375],
+    [0.2126729, 0.7151522, 0.0721750],
+    [0.0193339, 0.1191920, 0.9503041],
+]
+_XYZ_TO_RGB = [
+    [ 3.2404542, -1.5371385, -0.4985314],
+    [-0.9692660,  1.8760108,  0.0415560],
+    [ 0.0556434, -0.2040259,  1.0572252],
+]
+
+
+def _rgb_to_lab(rgb: torch.Tensor) -> torch.Tensor:
+    """Convert sRGB images to CIE LAB.
+
+    Args:
+        rgb: (B, 3, H, W) float in [0, 1], sRGB gamma-encoded.
+
+    Returns:
+        lab: (B, 3, H, W) — L in [0, 100], a/b in ~[-128, 127].
+    """
+    # sRGB gamma decode (IEC 61966-2-1)
+    lin = torch.where(
+        rgb <= 0.04045,
+        rgb / 12.92,
+        ((rgb + 0.055) / 1.055).pow(2.4),
+    )
+
+    # Linear RGB → CIE XYZ (D65)
+    mat = torch.tensor(_RGB_TO_XYZ, device=rgb.device, dtype=rgb.dtype)
+    xyz = torch.einsum("ij,bjhw->bihw", mat, lin)  # (B, 3, H, W)
+
+    # Normalise by D65 illuminant
+    d65 = torch.tensor(_D65, device=rgb.device, dtype=rgb.dtype).view(1, 3, 1, 1)
+    xyz = xyz / d65
+
+    # CIE f function  §4.2 CIE 015:2004
+    delta = 6.0 / 29.0
+    t = xyz.clamp(min=0.0)
+    f = torch.where(t > delta ** 3, t.pow(1.0 / 3.0), t / (3.0 * delta ** 2) + 4.0 / 29.0)
+
+    L = 116.0 * f[:, 1:2] - 16.0
+    a = 500.0 * (f[:, 0:1] - f[:, 1:2])
+    b = 200.0 * (f[:, 1:2] - f[:, 2:3])
+    return torch.cat([L, a, b], dim=1)
+
+
+def _lab_to_rgb(lab: torch.Tensor) -> torch.Tensor:
+    """Convert CIE LAB to sRGB images.
+
+    Args:
+        lab: (B, 3, H, W) — L in [0, 100], a/b in ~[-128, 127].
+
+    Returns:
+        rgb: (B, 3, H, W) float in [0, 1], clamped to valid range.
+    """
+    L, a, b = lab[:, 0:1], lab[:, 1:2], lab[:, 2:3]
+    fy = (L + 16.0) / 116.0
+    fx = a / 500.0 + fy
+    fz = fy - b / 200.0
+
+    delta = 6.0 / 29.0
+
+    def _f_inv(t: torch.Tensor) -> torch.Tensor:
+        return torch.where(t > delta, t.pow(3.0), 3.0 * delta ** 2 * (t - 4.0 / 29.0))
+
+    d65 = torch.tensor(_D65, device=lab.device, dtype=lab.dtype).view(1, 3, 1, 1)
+    xyz = torch.cat([_f_inv(fx), _f_inv(fy), _f_inv(fz)], dim=1) * d65  # (B, 3, H, W)
+
+    # CIE XYZ → linear sRGB
+    mat = torch.tensor(_XYZ_TO_RGB, device=lab.device, dtype=lab.dtype)
+    lin = torch.einsum("ij,bjhw->bihw", mat, xyz).clamp(0.0, 1.0)
+
+    # sRGB gamma encode
+    rgb = torch.where(
+        lin <= 0.0031308,
+        lin * 12.92,
+        1.055 * lin.pow(1.0 / 2.4) - 0.055,
+    )
+    return rgb.clamp(0.0, 1.0)
+
+
 def blend_latents_local(
     src: torch.Tensor,
     gen: torch.Tensor,
@@ -154,3 +248,86 @@ def blend_latents_local(
 
     # Spatial composite: inside mask use freq_blended, outside use src.
     return mask * freq_blended + (1.0 - mask) * src
+
+
+def blend_images_lab(
+    src: torch.Tensor,
+    gen: torch.Tensor,
+    cutoff_ratio: float = 0.5,
+) -> torch.Tensor:
+    """FFT-blend decoded RGB images in LAB space, touching only the L channel.
+
+    Keeps *src*'s low-frequency luminance (global lighting) while leaving
+    *gen*'s chroma (A/B channels) completely unchanged. This avoids the colour
+    washout that occurs when blending all channels in latent space.
+
+    Args:
+        src: source RGB image, shape (B, 3, H, W), float in [0, 1].
+        gen: generated RGB image, same shape as *src*.
+        cutoff_ratio: low-freq radius fraction in [0, 1]. 0 → gen luminance;
+                      1 → src luminance (gen chroma preserved in both cases).
+
+    Returns:
+        Blended RGB image, shape (B, 3, H, W), float in [0, 1].
+    """
+    _validate_inputs(src, gen, cutoff_ratio)
+    if src.shape[1] != 3:
+        raise ValueError(f"Expected 3-channel RGB input, got {src.shape[1]} channels")
+
+    # FFT and LAB gamma ops require float32 — ComplexHalf is not reliably supported.
+    in_dtype = src.dtype
+    src32 = src.to(torch.float32)
+    gen32 = gen.to(torch.float32)
+
+    src_lab = _rgb_to_lab(src32)
+    gen_lab = _rgb_to_lab(gen32)
+
+    src_L = src_lab[:, 0:1]   # (B, 1, H, W)
+    gen_L = gen_lab[:, 0:1]
+    gen_AB = gen_lab[:, 1:3]  # chroma stays from gen
+
+    blended_L = blend_latents(src_L, gen_L, cutoff_ratio)  # (B, 1, H, W)
+    blended_lab = torch.cat([blended_L, gen_AB], dim=1)    # (B, 3, H, W)
+    return _lab_to_rgb(blended_lab).to(in_dtype)
+
+
+def global_brightness_match(
+    src: torch.Tensor,
+    gen: torch.Tensor,
+) -> torch.Tensor:
+    """Scale *gen*'s luminance to match *src*'s mean L, keeping gen's chroma.
+
+    A single scalar per image adjusts exposure without frequency-domain
+    artifacts or local structure transfer. Simpler than blend_images_lab when
+    only global brightness correction is needed.
+
+    Args:
+        src: source RGB image, shape (B, 3, H, W), float in [0, 1].
+        gen: generated RGB image, same shape as *src*.
+
+    Returns:
+        Gen image with L channel globally scaled to match src mean L.
+        Shape (B, 3, H, W), float in [0, 1], same dtype as src.
+    """
+    if src.shape != gen.shape:
+        raise ValueError(
+            f"src and gen must have the same shape, got {src.shape} vs {gen.shape}"
+        )
+    if src.shape[1] != 3:
+        raise ValueError(f"Expected 3-channel RGB input, got {src.shape[1]} channels")
+
+    in_dtype = src.dtype
+    src32 = src.to(torch.float32)
+    gen32 = gen.to(torch.float32)
+
+    src_lab = _rgb_to_lab(src32)
+    gen_lab = _rgb_to_lab(gen32)
+
+    # Scalar ratio: src mean brightness / gen mean brightness, per batch element.
+    src_mean_L = src_lab[:, 0:1].mean(dim=(-2, -1), keepdim=True)  # (B, 1, 1, 1)
+    gen_mean_L = gen_lab[:, 0:1].mean(dim=(-2, -1), keepdim=True)
+    scale = src_mean_L / gen_mean_L.clamp(min=1e-6)
+
+    adjusted_L = gen_lab[:, 0:1] * scale           # scale gen L toward src exposure
+    adjusted_lab = torch.cat([adjusted_L, gen_lab[:, 1:3]], dim=1)  # keep gen AB
+    return _lab_to_rgb(adjusted_lab).to(in_dtype)

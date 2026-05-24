@@ -12,9 +12,10 @@ import torch
 from attn_texture.core.fft_blend import (
     _lab_to_rgb,
     _rgb_to_lab,
+    blend_images_lab,
     blend_latents,
-    blend_latents_lab,
     blend_latents_local,
+    global_brightness_match,
 )
 
 
@@ -236,3 +237,223 @@ class TestBlendLatentsLocal:
         src, gen = pair
         mask = torch.rand(self.B, 1, self.H, self.W)
         assert torch.isfinite(blend_latents_local(src, gen, mask)).all()
+
+
+# ---------------------------------------------------------------------------
+# _rgb_to_lab / _lab_to_rgb — colour-space helpers
+# ---------------------------------------------------------------------------
+
+
+class TestRgbLabRoundTrip:
+    B, H, W = 2, 8, 8
+
+    @pytest.fixture()
+    def rgb(self):
+        torch.manual_seed(42)
+        return torch.rand(self.B, 3, self.H, self.W)
+
+    def test_rgb_to_lab_shape(self, rgb):
+        assert _rgb_to_lab(rgb).shape == rgb.shape
+
+    def test_lab_to_rgb_shape(self, rgb):
+        assert _lab_to_rgb(_rgb_to_lab(rgb)).shape == rgb.shape
+
+    def test_round_trip(self, rgb):
+        recovered = _lab_to_rgb(_rgb_to_lab(rgb))
+        assert torch.allclose(recovered, rgb, atol=1e-4)
+
+    def test_white_l_is_100(self):
+        white = torch.ones(1, 3, 1, 1)
+        lab = _rgb_to_lab(white)
+        assert abs(lab[0, 0, 0, 0].item() - 100.0) < 0.5
+
+    def test_black_l_is_zero(self):
+        black = torch.zeros(1, 3, 1, 1)
+        lab = _rgb_to_lab(black)
+        assert abs(lab[0, 0, 0, 0].item()) < 0.5
+
+    def test_lab_to_rgb_output_clamped(self, rgb):
+        out = _lab_to_rgb(_rgb_to_lab(rgb))
+        assert out.min().item() >= 0.0
+        assert out.max().item() <= 1.0 + 1e-6
+
+    def test_dtype_preserved(self, rgb):
+        assert _rgb_to_lab(rgb).dtype == rgb.dtype
+        assert _lab_to_rgb(_rgb_to_lab(rgb)).dtype == rgb.dtype
+
+
+# ---------------------------------------------------------------------------
+# blend_images_lab — pixel-space LAB luminance blend
+# ---------------------------------------------------------------------------
+
+
+class TestBlendImagesLab:
+    B, H, W = 1, 16, 16
+
+    @pytest.fixture()
+    def pair(self):
+        torch.manual_seed(20)
+        src = torch.rand(self.B, 3, self.H, self.W)
+        gen = torch.rand(self.B, 3, self.H, self.W)
+        return src, gen
+
+    def test_output_shape(self, pair):
+        src, gen = pair
+        assert blend_images_lab(src, gen).shape == (self.B, 3, self.H, self.W)
+
+    def test_no_nan_or_inf(self, pair):
+        src, gen = pair
+        assert torch.isfinite(blend_images_lab(src, gen)).all()
+
+    def test_output_in_unit_range(self, pair):
+        src, gen = pair
+        out = blend_images_lab(src, gen)
+        assert out.min().item() >= 0.0
+        assert out.max().item() <= 1.0 + 1e-6
+
+    def test_ab_channels_come_from_gen(self, pair):
+        """Output must equal the LAB-assembled image using gen's chroma.
+
+        Checking round-trip LAB→RGB→LAB is fragile for out-of-gamut colours
+        (src-L + gen-AB can go out of sRGB range, clamping distorts the AB
+        when going back). Instead we reconstruct the expected output with the
+        same logic and compare directly.
+        """
+        src, gen = pair
+        out = blend_images_lab(src, gen)
+        gen_lab = _rgb_to_lab(gen)
+        src_L = _rgb_to_lab(src)[:, 0:1]
+        blended_L = blend_latents(src_L, gen_lab[:, 0:1], cutoff_ratio=0.5)
+        expected = _lab_to_rgb(torch.cat([blended_L, gen_lab[:, 1:3]], dim=1))
+        assert torch.allclose(out, expected, atol=1e-6), (
+            "Output should equal LAB blend with gen's AB channels preserved"
+        )
+
+    def test_l_low_freq_from_src(self, pair):
+        """Low-freq L bins must be closer to src's L than gen's L."""
+        src, gen = pair
+        cutoff = 0.3
+        out = blend_images_lab(src, gen, cutoff_ratio=cutoff)
+
+        src_L = _rgb_to_lab(src)[:, 0:1]
+        gen_L = _rgb_to_lab(gen)[:, 0:1]
+        out_L = _rgb_to_lab(out)[:, 0:1]
+
+        ry, rx = _low_freq_region(self.H, self.W, cutoff)
+        err_src = (_fftshift2(out_L)[..., ry, rx] - _fftshift2(src_L)[..., ry, rx]).abs().mean()
+        err_gen = (_fftshift2(out_L)[..., ry, rx] - _fftshift2(gen_L)[..., ry, rx]).abs().mean()
+        assert err_src < err_gen, (
+            f"Low-freq L should be closer to src (Δsrc={err_src:.4f}, Δgen={err_gen:.4f})"
+        )
+
+    def test_identity_when_src_equals_gen(self):
+        torch.manual_seed(21)
+        t = torch.rand(1, 3, 16, 16)
+        out = blend_images_lab(t, t)
+        assert torch.allclose(out, t, atol=1e-4)
+
+    def test_cutoff_zero_returns_gen(self, pair):
+        """cutoff=0 → entire L from gen → output ≈ gen (same L and AB)."""
+        src, gen = pair
+        out = blend_images_lab(src, gen, cutoff_ratio=0.0)
+        assert torch.allclose(out, gen, atol=1e-4)
+
+    def test_rejects_non_rgb(self):
+        t = torch.rand(1, 4, 16, 16)
+        with pytest.raises(ValueError, match="3-channel"):
+            blend_images_lab(t, t)
+
+    def test_rejects_mismatched_shapes(self):
+        src = torch.rand(1, 3, 16, 16)
+        gen = torch.rand(1, 3, 8, 8)
+        with pytest.raises(ValueError, match="shape"):
+            blend_images_lab(src, gen)
+
+    def test_rejects_invalid_cutoff(self):
+        t = torch.rand(1, 3, 16, 16)
+        with pytest.raises(ValueError, match="cutoff_ratio"):
+            blend_images_lab(t, t, cutoff_ratio=1.5)
+
+
+# ---------------------------------------------------------------------------
+# global_brightness_match — scalar L-channel exposure correction
+# ---------------------------------------------------------------------------
+
+
+class TestGlobalBrightnessMatch:
+    B, H, W = 1, 16, 16
+
+    @pytest.fixture()
+    def pair(self):
+        torch.manual_seed(30)
+        src = torch.rand(self.B, 3, self.H, self.W)
+        gen = torch.rand(self.B, 3, self.H, self.W)
+        return src, gen
+
+    def test_output_shape(self, pair):
+        src, gen = pair
+        assert global_brightness_match(src, gen).shape == (self.B, 3, self.H, self.W)
+
+    def test_no_nan_or_inf(self, pair):
+        src, gen = pair
+        assert torch.isfinite(global_brightness_match(src, gen)).all()
+
+    def test_output_in_unit_range(self, pair):
+        src, gen = pair
+        out = global_brightness_match(src, gen)
+        assert out.min().item() >= 0.0
+        assert out.max().item() <= 1.0 + 1e-6
+
+    def test_dtype_preserved(self, pair):
+        src, gen = pair
+        assert global_brightness_match(src, gen).dtype == src.dtype
+
+    def test_identity_when_src_equals_gen(self):
+        """Same image → scale=1 → output equals input."""
+        torch.manual_seed(31)
+        t = torch.rand(1, 3, 16, 16)
+        out = global_brightness_match(t, t)
+        assert torch.allclose(out, t, atol=1e-4)
+
+    def test_ab_channels_from_gen(self, pair):
+        """Output must equal the LAB-assembled image using gen's original AB channels."""
+        src, gen = pair
+        out = global_brightness_match(src, gen)
+        gen_lab = _rgb_to_lab(gen)
+        src_lab = _rgb_to_lab(src)
+        src_mean_L = src_lab[:, 0:1].mean(dim=(-2, -1), keepdim=True)
+        gen_mean_L = gen_lab[:, 0:1].mean(dim=(-2, -1), keepdim=True)
+        scale = src_mean_L / gen_mean_L.clamp(min=1e-6)
+        adjusted_L = gen_lab[:, 0:1] * scale
+        expected = _lab_to_rgb(torch.cat([adjusted_L, gen_lab[:, 1:3]], dim=1))
+        assert torch.allclose(out, expected, atol=1e-6)
+
+    def test_bright_src_lifts_dark_gen(self):
+        """Output mean L must be higher than gen's mean L when src is much brighter."""
+        # src: near-white; gen: near-black
+        src = torch.full((1, 3, 16, 16), 0.9)
+        gen = torch.full((1, 3, 16, 16), 0.1)
+        out = global_brightness_match(src, gen)
+        gen_L = _rgb_to_lab(gen)[:, 0:1].mean().item()
+        out_L = _rgb_to_lab(out)[:, 0:1].mean().item()
+        assert out_L > gen_L, f"Expected output L ({out_L:.2f}) > gen L ({gen_L:.2f})"
+
+    def test_dark_src_darkens_bright_gen(self):
+        """Output mean L must be lower than gen's mean L when src is much darker."""
+        src = torch.full((1, 3, 16, 16), 0.1)
+        gen = torch.full((1, 3, 16, 16), 0.9)
+        out = global_brightness_match(src, gen)
+        gen_L = _rgb_to_lab(gen)[:, 0:1].mean().item()
+        out_L = _rgb_to_lab(out)[:, 0:1].mean().item()
+        assert out_L < gen_L, f"Expected output L ({out_L:.2f}) < gen L ({gen_L:.2f})"
+
+    def test_rejects_non_rgb(self):
+        t = torch.rand(1, 4, 16, 16)
+        with pytest.raises(ValueError, match="3-channel"):
+            global_brightness_match(t, t)
+
+    def test_rejects_mismatched_shapes(self):
+        src = torch.rand(1, 3, 16, 16)
+        gen = torch.rand(1, 3, 8, 8)
+        with pytest.raises(ValueError, match="shape"):
+            global_brightness_match(src, gen)
