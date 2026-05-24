@@ -10,6 +10,8 @@ psnr          — scikit-image peak_signal_noise_ratio, data_range=255
 lpips_score   — lpips.LPIPS(net="alex"); singleton loaded once per process
 clip_score    — openai/clip-vit-base-patch32 cosine similarity (image ↔ prompt)
 dino_distance — facebook/dino-vits8 CLS-token distance (1 − cosine_similarity)
+               Uses AutoImageProcessor (transformers ≥ 4.36 / 5.x compatible)
+
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import torch.nn.functional as F
 from loguru import logger
 from PIL import Image
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-from transformers import AutoFeatureExtractor, AutoModel, CLIPModel, CLIPProcessor
+from transformers import AutoImageProcessor, AutoModel, CLIPModel, CLIPProcessor
 
 import lpips as _lpips_lib
 
@@ -32,7 +34,7 @@ _lpips_model: "_lpips_lib.LPIPS | None" = None
 _clip_model: "CLIPModel | None" = None
 _clip_processor: "CLIPProcessor | None" = None
 _dino_model: "AutoModel | None" = None
-_dino_extractor: "AutoFeatureExtractor | None" = None
+_dino_extractor: "AutoImageProcessor | None" = None
 
 
 def _get_lpips_model() -> "_lpips_lib.LPIPS":
@@ -54,11 +56,11 @@ def _get_clip() -> tuple["CLIPModel", "CLIPProcessor"]:
     return _clip_model, _clip_processor
 
 
-def _get_dino() -> tuple["AutoModel", "AutoFeatureExtractor"]:
+def _get_dino() -> tuple["AutoModel", "AutoImageProcessor"]:
     global _dino_model, _dino_extractor
     if _dino_model is None:
         logger.debug("Loading DINO {} (first call only)…", _DINO_MODEL_ID)
-        _dino_extractor = AutoFeatureExtractor.from_pretrained(_DINO_MODEL_ID)
+        _dino_extractor = AutoImageProcessor.from_pretrained(_DINO_MODEL_ID)
         _dino_model = AutoModel.from_pretrained(_DINO_MODEL_ID)
         _dino_model.eval()
     return _dino_model, _dino_extractor
@@ -165,13 +167,12 @@ def clip_score(image: Image.Image, prompt: str) -> float:
         padding=True,
     )
     with torch.no_grad():
-        img_embeds = model.get_image_features(pixel_values=inputs["pixel_values"])
-        txt_embeds = model.get_text_features(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs.get("attention_mask"),
-        )
-    img_embeds = F.normalize(img_embeds, dim=-1)
-    txt_embeds = F.normalize(txt_embeds, dim=-1)
+        # Single forward pass — CLIPOutput has .image_embeds and .text_embeds
+        # (projected to the shared embedding space).  Avoids get_image_features /
+        # get_text_features whose return type changed between transformers versions.
+        outputs = model(**inputs, return_dict=True)
+    img_embeds = F.normalize(outputs.image_embeds, dim=-1)
+    txt_embeds = F.normalize(outputs.text_embeds, dim=-1)
     return float((img_embeds * txt_embeds).sum().item())
 
 

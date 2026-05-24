@@ -173,10 +173,15 @@ class TestClipScore:
             "input_ids": torch.zeros(1, 10, dtype=torch.long),
             "attention_mask": torch.ones(1, 10, dtype=torch.long),
         }
-        mock_model = MagicMock()
+
+        # CLIPOutput returned by model(**inputs, return_dict=True)
         _aligned = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
-        mock_model.get_image_features.return_value = _aligned.clone()
-        mock_model.get_text_features.return_value = _aligned.clone()
+        mock_output = MagicMock()
+        mock_output.image_embeds = _aligned.clone()
+        mock_output.text_embeds = _aligned.clone()
+
+        mock_model = MagicMock()
+        mock_model.return_value = mock_output
 
         old_model, old_proc = _m._clip_model, _m._clip_processor
         _m._clip_model = mock_model
@@ -199,24 +204,28 @@ class TestClipScore:
 
     def test_orthogonal_embeddings_return_zero(self, inject_clip):
         mock_model, _ = inject_clip
-        mock_model.get_image_features.return_value = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
-        mock_model.get_text_features.return_value = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+        mock_output = MagicMock()
+        mock_output.image_embeds = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        mock_output.text_embeds = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+        mock_model.return_value = mock_output
         result = clip_score(_solid(0, 0, 0), "orthogonal prompt")
         assert result == pytest.approx(0.0, abs=1e-4)
 
     def test_opposite_embeddings_return_minus_one(self, inject_clip):
         mock_model, _ = inject_clip
-        mock_model.get_image_features.return_value = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
-        mock_model.get_text_features.return_value = torch.tensor([[-1.0, 0.0, 0.0, 0.0]])
+        mock_output = MagicMock()
+        mock_output.image_embeds = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        mock_output.text_embeds = torch.tensor([[-1.0, 0.0, 0.0, 0.0]])
+        mock_model.return_value = mock_output
         result = clip_score(_solid(0, 0, 0), "opposite")
         assert result == pytest.approx(-1.0, abs=1e-4)
 
-    def test_image_and_text_features_both_called(self, inject_clip):
+    def test_model_called_once_with_all_inputs(self, inject_clip):
+        """Single combined forward pass — no separate image/text feature calls."""
         mock_model, mock_proc = inject_clip
         clip_score(_solid(100, 100, 100), "silk fabric")
         mock_proc.assert_called_once()
-        mock_model.get_image_features.assert_called_once()
-        mock_model.get_text_features.assert_called_once()
+        mock_model.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +258,7 @@ class TestDinoDistance:
         mock_model.return_value.last_hidden_state = self._cls_hidden([1.0, 0.0, 0.0, 0.0])
 
         old_model, old_ext = _m._dino_model, _m._dino_extractor
-        _m._dino_model = mock_model
+        _m._dino_model  = mock_model
         _m._dino_extractor = mock_ext
         yield mock_model, mock_ext
         _m._dino_model = old_model
