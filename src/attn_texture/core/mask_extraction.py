@@ -420,10 +420,10 @@ def register_attention_control(
     )
 
     def _cleanup() -> None:
-        unet.set_attn_processor(original)
+        n = len(original)
+        unet.set_attn_processor(dict(original))  # copy: set_attn_processor pops entries
         logger.debug(
-            "register_attention_control: restored {} original processors",
-            len(original),
+            "register_attention_control: restored {} original processors", n
         )
 
     return _cleanup
