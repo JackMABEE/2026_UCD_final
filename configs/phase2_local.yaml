@@ -1,0 +1,45 @@
+# configs/phase2_local.yaml
+# Phase 2: region-aware garment texture transfer — all tunable hyperparameters.
+# Nothing in src/ may hardcode a value that appears here.
+# Do not mutate this file once it backs a published experiment — copy it instead
+# (CLAUDE.md §6 rule 9).
+
+# ── Reproducibility ─────────────────────────────────────────────────────────
+seed: 42
+
+# ── Model identifier (HuggingFace hub) ──────────────────────────────────────
+model_id: "runwayml/stable-diffusion-v1-5"
+
+# ── Input preprocessing ──────────────────────────────────────────────────────
+image_size: [512, 512]          # [width, height] applied to source image before encoding
+
+# ── Output ───────────────────────────────────────────────────────────────────
+experiments_root: "experiments"
+
+# ── PnP pipeline (TwoPassPipeline, applied inside mask region only) ───────────
+pnp:
+  tau_f: 0.8                    # spatial-feature injection gate  (§4 Eq. 3; 0 < τ_f < 1)
+  tau_A: 0.5                    # self-attention injection gate   (§4 Eq. 4; 0 < τ_A < 1)
+  guidance_scale: 7.5
+  num_inference_steps: 50
+  fft_cutoff_ratio: 0.10        # low-freq radius for FFT lighting blend (0=pure gen, 1=pure src)
+
+# ── Mask extraction (cross-attention dry-run) ──────────────────────────────────
+#
+# The dry-run runs a short DDIM inversion + denoising pass with the gen prompt,
+# accumulating cross-attention maps for each step.  Only the cross-attention
+# (attn2) layers are hooked; self-attention (attn1) is untouched.
+#
+# Layer selection follows Hertz et al. (P2P, ICLR 2023) §3.2 / LocalBlend:
+#   • aggregate_res = 16:  16×16 maps best balance spatial precision vs. noise
+#   • aggregate_places: "down" + "up" (mid-resolution down+up blocks, not mid)
+#   • threshold = 0.3:    P2P default; lower → larger mask, higher → tighter
+#
+mask:
+  dry_run_steps: 10             # DDIM steps for attention accumulation (fewer = faster)
+  aggregate_res: 16             # spatial side to select (16 for 512px SD 1.5)
+  aggregate_places:             # UNet blocks contributing to the mask (P2P §3.2)
+    - "down"
+    - "up"
+  threshold: 0.3                # binary threshold in [0, 1]; lower = larger mask
+  max_spatial_side: 32          # AttentionStore filter: retain maps ≤ this spatial side
