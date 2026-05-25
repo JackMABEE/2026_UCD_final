@@ -6,14 +6,14 @@ hermetic — the correctness of individual metrics is covered by test_metrics.py
 Contract under test
 -------------------
 run_shootout(exp_name, original, sdedit, controlnet, pnp_baseline, ours,
-             experiments_root) -> dict[str, dict[str, float]]
+             gen_prompt, experiments_root) -> dict[str, dict[str, float]]
 
     Side effects:
       • experiments_root / exp_name / shootout.png  — 1×5 RGB panel
       • experiments_root / exp_name / metrics.json  — nested dict
 
     Return value mirrors the JSON structure:
-      {"sdedit": {"ssim": …, "psnr": …, "lpips": …},
+      {"sdedit": {"ssim": …, "psnr": …, "lpips": …, "clip": …, "dino": …},
        "controlnet": {…}, "pnp_baseline": {…}, "ours": {…}}
 
     The panel has:
@@ -156,7 +156,7 @@ class TestMetricsJson:
         data = json.loads((exp_dir / "metrics.json").read_text())
         assert set(data.keys()) == set(_METHODS_NON_ORIG)
 
-    def test_each_method_has_exactly_three_metric_keys(self, exp_dir):
+    def test_each_method_has_exactly_five_metric_keys(self, exp_dir):
         data = json.loads((exp_dir / "metrics.json").read_text())
         for method in _METHODS_NON_ORIG:
             assert set(data[method].keys()) == _METRIC_KEYS, (
@@ -199,7 +199,7 @@ class TestReturnValue:
     def test_dict_has_exactly_four_method_keys(self, result):
         assert set(result.keys()) == set(_METHODS_NON_ORIG)
 
-    def test_each_method_has_three_metric_keys(self, result):
+    def test_each_method_has_five_metric_keys(self, result):
         for method in _METHODS_NON_ORIG:
             assert set(result[method].keys()) == _METRIC_KEYS
 

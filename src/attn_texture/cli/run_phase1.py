@@ -21,6 +21,9 @@ What it does
 7. Call run_shootout() to save shootout.png and metrics.json under
    cfg.experiments_root / exp_name.
 
+Note: MasaCtrl (_run_masactrl) is available in this file but excluded from
+the default shootout pending per-task parameter tuning.
+
 Model weights are loaded from HuggingFace hub via model_id / controlnet_id
 in the config.  On MPS, fp16 is avoided automatically by utils/device.py.
 """
@@ -45,6 +48,7 @@ from attn_texture.utils.seed import seed_everything
 from attn_texture.core.two_pass_pipeline import TwoPassPipeline
 from attn_texture.baselines.sdedit_runner import SDEditRunner
 from attn_texture.baselines.controlnet_runner import ControlNetRunner
+from attn_texture.baselines.masactrl_runner import MasaCtrlRunner
 from attn_texture.eval.shootout import run_shootout
 
 _DEFAULT_CONFIG = Path(__file__).parents[3] / "configs" / "phase1_global.yaml"
@@ -164,6 +168,21 @@ def _run_controlnet(cfg, source_image, gen_prompt: str):
             num_inference_steps=cfg.controlnet.num_inference_steps,
         )
     logger.info("controlnet: done.")
+    return result
+
+
+def _run_masactrl(cfg, source_image, ref_prompt: str, gen_prompt: str):
+    logger.info("─── Running: MasaCtrl baseline ───")
+    with with_isolated_model(lambda: _load_sd_components(cfg)) as comps:
+        unet, vae, scheduler, tokenizer, text_encoder = comps
+        runner = MasaCtrlRunner(unet, vae, scheduler, tokenizer, text_encoder, cfg.masactrl)
+        result = runner.run(
+            source_image=source_image,
+            ref_prompt=ref_prompt,
+            gen_prompt=gen_prompt,
+            num_inference_steps=cfg.masactrl.num_inference_steps,
+        )
+    logger.info("masactrl: done.")
     return result
 
 

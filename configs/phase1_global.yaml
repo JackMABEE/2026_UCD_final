@@ -35,3 +35,10 @@ controlnet:
   canny_high: 200             # upper Canny threshold
   guidance_scale: 7.5
   num_inference_steps: 50
+
+# ── MasaCtrl baseline (mutual self-attention, Cao et al. ICCV 2023) ───────────
+masactrl:
+  step_start: 4               # inject K/V only after this many denoising steps (§4.2)
+  layer_start: 10             # inject K/V only in layers at or above this index (§4.2)
+  guidance_scale: 7.5
+  num_inference_steps: 50

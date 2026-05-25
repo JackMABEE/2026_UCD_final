@@ -2,8 +2,8 @@
 
 Accepts five PIL images (original, sdedit, controlnet, pnp_baseline, ours),
 stitches them into a side-by-side panel with burned-in labels, computes
-SSIM / PSNR / LPIPS for each method vs. the original, and writes two
-artefacts to the experiment directory:
+SSIM / PSNR / LPIPS / CLIP / DINO for each method vs. the original, and writes
+two artefacts to the experiment directory:
 
   experiments/<exp_name>/shootout.png   — 1×5 RGB panel
   experiments/<exp_name>/metrics.json   — nested dict, one entry per method
