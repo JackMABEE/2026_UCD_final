@@ -9,6 +9,7 @@ Public API
 blend_latents           — global blend in latent space, whole spatial extent
 blend_latents_local     — blend only inside a spatial mask (Phase 2)
 blend_images_lab        — pixel-space blend: L channel only, gen chroma preserved
+match_ab_histogram      — histogram-match AB chroma of blended to a reference image
 global_brightness_match — scalar L-channel brightness correction (no FFT)
 _rgb_to_lab             — sRGB → CIE LAB (exported for testing)
 _lab_to_rgb             — CIE LAB → sRGB (exported for testing)
@@ -254,18 +255,23 @@ def blend_images_lab(
     src: torch.Tensor,
     gen: torch.Tensor,
     cutoff_ratio: float = 0.5,
+    blend_weight: float = 0.5,
 ) -> torch.Tensor:
     """FFT-blend decoded RGB images in LAB space, touching only the L channel.
 
-    Keeps *src*'s low-frequency luminance (global lighting) while leaving
-    *gen*'s chroma (A/B channels) completely unchanged. This avoids the colour
-    washout that occurs when blending all channels in latent space.
+    For low-frequency L bins: *blend_weight* * src_L + (1 - *blend_weight*) * gen_L.
+    For high-frequency L bins: gen_L (unchanged).
+    A/B chroma channels: always taken from *gen* (colour palette preserved).
 
     Args:
         src: source RGB image, shape (B, 3, H, W), float in [0, 1].
         gen: generated RGB image, same shape as *src*.
-        cutoff_ratio: low-freq radius fraction in [0, 1]. 0 → gen luminance;
-                      1 → src luminance (gen chroma preserved in both cases).
+        cutoff_ratio: low-freq radius fraction in [0, 1]. 0 → all L from gen;
+                      1 → blend_weight controls entire L channel.
+        blend_weight: low-freq mixing weight in [0, 1].
+                      1.0 → 100 % src low-freq (original lighting fully preserved).
+                      0.0 → 100 % gen low-freq (source lighting discarded).
+                      0.5 → equal mix.
 
     Returns:
         Blended RGB image, shape (B, 3, H, W), float in [0, 1].
@@ -273,6 +279,8 @@ def blend_images_lab(
     _validate_inputs(src, gen, cutoff_ratio)
     if src.shape[1] != 3:
         raise ValueError(f"Expected 3-channel RGB input, got {src.shape[1]} channels")
+    if not (0.0 <= blend_weight <= 1.0):
+        raise ValueError(f"blend_weight must be in [0, 1], got {blend_weight}")
 
     # FFT and LAB gamma ops require float32 — ComplexHalf is not reliably supported.
     in_dtype = src.dtype
@@ -286,9 +294,87 @@ def blend_images_lab(
     gen_L = gen_lab[:, 0:1]
     gen_AB = gen_lab[:, 1:3]  # chroma stays from gen
 
-    blended_L = blend_latents(src_L, gen_L, cutoff_ratio)  # (B, 1, H, W)
+    # cutoff_ratio=0 → low-freq mask covers nothing → all L from gen.
+    if cutoff_ratio <= 0.0:
+        blended_L = gen_L
+    else:
+        H, W = src_L.shape[-2:]
+        src_fft = torch.fft.fftshift(torch.fft.fftn(src_L, dim=(-2, -1)), dim=(-2, -1))
+        gen_fft = torch.fft.fftshift(torch.fft.fftn(gen_L, dim=(-2, -1)), dim=(-2, -1))
+
+        low_mask = _make_low_freq_mask(H, W, cutoff_ratio, src_L.device, torch.float32)
+
+        # Low-freq: weighted mix; high-freq: gen only.  # § 3.2 Eq.(1)
+        mixed_low = blend_weight * src_fft + (1.0 - blend_weight) * gen_fft
+        blended_fft = mixed_low * low_mask + gen_fft * (1.0 - low_mask)
+
+        blended_fft = torch.fft.ifftshift(blended_fft, dim=(-2, -1))
+        blended_L = torch.fft.ifftn(blended_fft, dim=(-2, -1)).real
+
     blended_lab = torch.cat([blended_L, gen_AB], dim=1)    # (B, 3, H, W)
     return _lab_to_rgb(blended_lab).to(in_dtype)
+
+
+def match_ab_histogram(
+    blended: torch.Tensor,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    """Match *blended*'s AB chroma channels to *reference*'s distribution.
+
+    Applies per-channel histogram matching in CIE LAB colour space. The L
+    channel is taken from *blended* unchanged; only the A and B channels are
+    redistributed to match *reference*'s cumulative distribution.
+
+    This corrects chroma drift introduced by FFT low-freq blending — e.g. a
+    colour cast from the source image's lighting leaking into the chroma —
+    without altering the luminance structure.
+
+    Uses scikit-image's ``match_histograms`` on CPU numpy arrays per batch
+    element (called once after the denoising loop, not on the hot path).
+
+    Args:
+        blended:   FFT-blended RGB image, shape (B, 3, H, W), float in [0, 1].
+        reference: Target AB distribution (typically gen_raw before blending),
+                   same shape as *blended*.
+
+    Returns:
+        RGB image with *blended*'s L channel and histogram-matched AB channels,
+        shape (B, 3, H, W), float in [0, 1].
+    """
+    import numpy as np
+    from skimage.exposure import match_histograms
+
+    if blended.shape != reference.shape:
+        raise ValueError(
+            f"blended and reference must have the same shape, "
+            f"got {blended.shape} vs {reference.shape}"
+        )
+    if blended.shape[1] != 3:
+        raise ValueError(f"Expected 3-channel RGB input, got {blended.shape[1]} channels")
+
+    in_dtype = blended.dtype
+    blended_lab = _rgb_to_lab(blended.to(torch.float32))    # (B, 3, H, W)
+    ref_lab = _rgb_to_lab(reference.to(torch.float32))
+
+    B = blended.shape[0]
+    matched_ab_list: list[torch.Tensor] = []
+
+    for b in range(B):
+        # (H, W, 2) float32 arrays for skimage
+        blend_ab = blended_lab[b, 1:3].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+        ref_ab = ref_lab[b, 1:3].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+
+        # Match A and B channels independently  (channel_axis=-1)
+        matched = match_histograms(blend_ab, ref_ab, channel_axis=-1).astype(np.float32)
+        matched_ab_list.append(
+            torch.from_numpy(matched).permute(2, 0, 1)   # (2, H, W)
+        )
+
+    matched_ab = torch.stack(matched_ab_list).to(device=blended.device)  # (B, 2, H, W)
+
+    # Rebuild LAB: keep blended's L, replace AB with matched version
+    result_lab = torch.cat([blended_lab[:, 0:1], matched_ab], dim=1)  # (B, 3, H, W)
+    return _lab_to_rgb(result_lab).to(in_dtype)
 
 
 def global_brightness_match(

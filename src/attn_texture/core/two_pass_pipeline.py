@@ -28,7 +28,7 @@ from omegaconf import DictConfig
 from PIL import Image
 
 from attn_texture.core.attention_injection import AttentionInjector
-from attn_texture.core.fft_blend import blend_images_lab
+from attn_texture.core.fft_blend import blend_images_lab, match_ab_histogram
 from attn_texture.utils.device import get_device_and_dtype, safe_to
 from attn_texture.utils.io import pil_to_tensor, tensor_to_pil
 
@@ -67,18 +67,20 @@ class TwoPassPipeline:
 
         self.guidance_scale: float = float(cfg.guidance_scale)
         self.fft_cutoff_ratio: float = float(cfg.fft_cutoff_ratio)
+        self.blend_weight: float = float(getattr(cfg, "blend_weight", 0.5))
 
         self.injector = AttentionInjector.from_config(unet, cfg)
         self.injector.register_hooks()
 
         logger.debug(
-            "TwoPassPipeline: device={} dtype={} tau_f={} tau_A={} guidance_scale={} fft_cutoff={}",
+            "TwoPassPipeline: device={} dtype={} tau_f={} tau_A={} guidance_scale={} fft_cutoff={} blend_weight={}",
             self._device,
             self._dtype,
             self.injector.tau_f,
             self.injector.tau_A,
             self.guidance_scale,
             self.fft_cutoff_ratio,
+            self.blend_weight,
         )
 
     # ------------------------------------------------------------------
@@ -163,18 +165,19 @@ class TwoPassPipeline:
                 gen_latents = self.scheduler.step(gen_noise_pred, t, gen_latents).prev_sample
 
             # 5. Decode gen latent → pixel tensor [0, 1]
-            decoded = self.vae.decode(gen_latents / self._vae_scale).sample  # (1, 3, H, W) ~[-1, 1]
-            decoded = (decoded / 2.0 + 0.5).clamp(0.0, 1.0)
+            gen_raw = (self.vae.decode(gen_latents / self._vae_scale).sample / 2.0 + 0.5).clamp(0.0, 1.0)
 
             # 6. FFT-blend luminance only in LAB space  # § 3.2 Eq.(1)
-            #    Keeps source low-freq lighting (L channel) while gen's chroma (AB) is unchanged,
-            #    avoiding the colour washout that latent-space blending caused.
-            src_pix = safe_to(src_pixels, device, decoded.dtype)
+            src_pix = safe_to(src_pixels, device, gen_raw.dtype)
             blended = blend_images_lab(
                 src=src_pix,
-                gen=decoded,
+                gen=gen_raw,
                 cutoff_ratio=self.fft_cutoff_ratio,
+                blend_weight=self.blend_weight,
             )
+
+            # 7. Histogram-match blended's AB channels to gen_raw (restore generated colour palette)
+            blended = match_ab_histogram(blended=blended, reference=gen_raw)
 
         return tensor_to_pil(blended[0].float())
 

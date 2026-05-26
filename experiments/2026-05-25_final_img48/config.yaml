@@ -11,6 +11,7 @@ ours:
   guidance_scale: 7.5
   num_inference_steps: 50
   fft_cutoff_ratio: 0.1
+  blend_weight: 0.5
 sdedit:
   strength: 0.6
   guidance_scale: 7.5
@@ -18,5 +19,10 @@ sdedit:
 controlnet:
   canny_low: 100
   canny_high: 200
+  guidance_scale: 7.5
+  num_inference_steps: 50
+masactrl:
+  step_start: 4
+  layer_start: 10
   guidance_scale: 7.5
   num_inference_steps: 50

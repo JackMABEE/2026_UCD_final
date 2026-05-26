@@ -16,6 +16,7 @@ from attn_texture.core.fft_blend import (
     blend_latents,
     blend_latents_local,
     global_brightness_match,
+    match_ab_histogram,
 )
 
 
@@ -317,10 +318,11 @@ class TestBlendImagesLab:
         Checking round-trip LAB→RGB→LAB is fragile for out-of-gamut colours
         (src-L + gen-AB can go out of sRGB range, clamping distorts the AB
         when going back). Instead we reconstruct the expected output with the
-        same logic and compare directly.
+        same logic and compare directly. Uses blend_weight=1.0 to match the
+        blend_latents reference (100 % src low-freq).
         """
         src, gen = pair
-        out = blend_images_lab(src, gen)
+        out = blend_images_lab(src, gen, blend_weight=1.0)
         gen_lab = _rgb_to_lab(gen)
         src_L = _rgb_to_lab(src)[:, 0:1]
         blended_L = blend_latents(src_L, gen_lab[:, 0:1], cutoff_ratio=0.5)
@@ -330,10 +332,10 @@ class TestBlendImagesLab:
         )
 
     def test_l_low_freq_from_src(self, pair):
-        """Low-freq L bins must be closer to src's L than gen's L."""
+        """With blend_weight=1.0, low-freq L bins must be closer to src's L than gen's L."""
         src, gen = pair
         cutoff = 0.3
-        out = blend_images_lab(src, gen, cutoff_ratio=cutoff)
+        out = blend_images_lab(src, gen, cutoff_ratio=cutoff, blend_weight=1.0)
 
         src_L = _rgb_to_lab(src)[:, 0:1]
         gen_L = _rgb_to_lab(gen)[:, 0:1]
@@ -358,6 +360,55 @@ class TestBlendImagesLab:
         out = blend_images_lab(src, gen, cutoff_ratio=0.0)
         assert torch.allclose(out, gen, atol=1e-4)
 
+    def test_blend_weight_one_matches_full_src_lowfreq(self, pair):
+        """blend_weight=1.0 → identical to 100%-src-low-freq (original behaviour)."""
+        src, gen = pair
+        cutoff = 0.3
+        result = blend_images_lab(src, gen, cutoff_ratio=cutoff, blend_weight=1.0)
+        gen_lab = _rgb_to_lab(gen)
+        blended_L = blend_latents(_rgb_to_lab(src)[:, 0:1], gen_lab[:, 0:1], cutoff_ratio=cutoff)
+        expected = _lab_to_rgb(torch.cat([blended_L, gen_lab[:, 1:3]], dim=1))
+        assert torch.allclose(result, expected, atol=1e-5)
+
+    def test_blend_weight_zero_equals_gen(self, pair):
+        """blend_weight=0.0 → all L from gen → output equals gen."""
+        src, gen = pair
+        out = blend_images_lab(src, gen, cutoff_ratio=0.3, blend_weight=0.0)
+        assert torch.allclose(out, gen, atol=1e-4)
+
+    def test_blend_weight_half_interpolates(self, pair):
+        """blend_weight=0.5 mean-L lies strictly between blend_weight=0 and blend_weight=1.
+
+        The FFT midpoint identity holds in the complex L domain, but _lab_to_rgb
+        clamping is nonlinear, so we use mean-L (which stays in-range) rather than
+        element-wise comparison.
+        """
+        src, gen = pair
+        cutoff = 0.3
+        out_w0 = blend_images_lab(src, gen, cutoff_ratio=cutoff, blend_weight=0.0)
+        out_w1 = blend_images_lab(src, gen, cutoff_ratio=cutoff, blend_weight=1.0)
+        out_w5 = blend_images_lab(src, gen, cutoff_ratio=cutoff, blend_weight=0.5)
+
+        # Endpoint results must differ (src ≠ gen for random pair)
+        assert not torch.allclose(out_w0, out_w1, atol=1e-4)
+
+        # Mean L at w=0.5 must lie between the two endpoint mean-Ls.
+        # This follows from IFFT linearity in the low-freq band.
+        L_w0 = _rgb_to_lab(out_w0)[:, 0:1].mean().item()
+        L_w1 = _rgb_to_lab(out_w1)[:, 0:1].mean().item()
+        L_w5 = _rgb_to_lab(out_w5)[:, 0:1].mean().item()
+        lo, hi = min(L_w0, L_w1), max(L_w0, L_w1)
+        assert lo <= L_w5 <= hi, (
+            f"Mean L at w=0.5 ({L_w5:.4f}) must be in [{lo:.4f}, {hi:.4f}]"
+        )
+
+    def test_rejects_invalid_blend_weight(self, pair):
+        src, gen = pair
+        with pytest.raises(ValueError, match="blend_weight"):
+            blend_images_lab(src, gen, blend_weight=1.5)
+        with pytest.raises(ValueError, match="blend_weight"):
+            blend_images_lab(src, gen, blend_weight=-0.1)
+
     def test_rejects_non_rgb(self):
         t = torch.rand(1, 4, 16, 16)
         with pytest.raises(ValueError, match="3-channel"):
@@ -373,6 +424,83 @@ class TestBlendImagesLab:
         t = torch.rand(1, 3, 16, 16)
         with pytest.raises(ValueError, match="cutoff_ratio"):
             blend_images_lab(t, t, cutoff_ratio=1.5)
+
+
+# ---------------------------------------------------------------------------
+# match_ab_histogram — chroma histogram matching
+# ---------------------------------------------------------------------------
+
+
+class TestMatchAbHistogram:
+    B, H, W = 1, 16, 16
+
+    @pytest.fixture()
+    def pair(self):
+        torch.manual_seed(50)
+        blended = torch.rand(self.B, 3, self.H, self.W)
+        reference = torch.rand(self.B, 3, self.H, self.W)
+        return blended, reference
+
+    def test_output_shape(self, pair):
+        blended, reference = pair
+        assert match_ab_histogram(blended, reference).shape == blended.shape
+
+    def test_no_nan_or_inf(self, pair):
+        blended, reference = pair
+        assert torch.isfinite(match_ab_histogram(blended, reference)).all()
+
+    def test_output_in_unit_range(self, pair):
+        blended, reference = pair
+        out = match_ab_histogram(blended, reference)
+        assert out.min().item() >= 0.0
+        assert out.max().item() <= 1.0 + 1e-6
+
+    def test_l_channel_from_blended_not_reference(self, pair):
+        """L channel in output must be closer to blended's L than reference's L."""
+        blended, reference = pair
+        out = match_ab_histogram(blended, reference)
+        blended_L = _rgb_to_lab(blended.float())[:, 0:1]
+        reference_L = _rgb_to_lab(reference.float())[:, 0:1]
+        out_L = _rgb_to_lab(out.float())[:, 0:1]
+        err_from_blended = (out_L - blended_L).abs().mean().item()
+        err_from_reference = (out_L - reference_L).abs().mean().item()
+        assert err_from_blended < err_from_reference
+
+    def test_ab_channels_match_reference_distribution(self, pair):
+        """Sorted AB values in output must be closer to reference's distribution than blended's."""
+        blended, reference = pair
+        out = match_ab_histogram(blended, reference)
+        out_lab = _rgb_to_lab(out.float())
+        blend_lab = _rgb_to_lab(blended.float())
+        ref_lab = _rgb_to_lab(reference.float())
+        for ch in [1, 2]:  # A and B
+            out_s = out_lab[:, ch].flatten().sort()[0]
+            blend_s = blend_lab[:, ch].flatten().sort()[0]
+            ref_s = ref_lab[:, ch].flatten().sort()[0]
+            err_to_ref = (out_s - ref_s).abs().mean().item()
+            err_to_blend = (out_s - blend_s).abs().mean().item()
+            assert err_to_ref < err_to_blend, (
+                f"ch={ch}: matched AB should be closer to reference "
+                f"(Δref={err_to_ref:.4f}, Δblend={err_to_blend:.4f})"
+            )
+
+    def test_identity_when_blended_equals_reference(self):
+        """blended == reference → output equals input (histogram is already matched)."""
+        torch.manual_seed(51)
+        t = torch.rand(1, 3, 16, 16)
+        out = match_ab_histogram(t, t)
+        assert torch.allclose(out, t, atol=1e-4)
+
+    def test_rejects_mismatched_shapes(self):
+        blended = torch.rand(1, 3, 16, 16)
+        reference = torch.rand(1, 3, 8, 8)
+        with pytest.raises(ValueError, match="shape"):
+            match_ab_histogram(blended, reference)
+
+    def test_rejects_non_rgb(self):
+        t = torch.rand(1, 4, 16, 16)
+        with pytest.raises(ValueError, match="3-channel"):
+            match_ab_histogram(t, t)
 
 
 # ---------------------------------------------------------------------------

@@ -215,6 +215,11 @@ Rules:
 - DINO: `facebook/dino-vits8`, CLS token distance (lower = more similar structure)
 - These match PnP paper Figure 9 evaluation protocol
 
+**Phase 2 mask_extraction.py**
+- Cross-attention mask at 16×16 resolution captures person-level regions, not pixel-precise garment boundaries
+- Known limitation: face included in "shirt" mask at this resolution — the CLIP cross-attention for garment tokens activates across the full person silhouette
+- Future work: replace with SAM or Mask2Former for precise part-level segmentation
+
 ---
 
-*Last updated: 2026-05-23*
+*Last updated: 2026-05-25*

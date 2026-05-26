@@ -245,7 +245,7 @@ def text_encoder() -> _MockTextEncoder:
 
 @pytest.fixture()
 def cfg():
-    return OmegaConf.create({"tau_f": 0.8, "tau_A": 0.5, "guidance_scale": 7.5, "fft_cutoff_ratio": 0.25})
+    return OmegaConf.create({"tau_f": 0.8, "tau_A": 0.5, "guidance_scale": 7.5, "fft_cutoff_ratio": 0.25, "blend_weight": 0.5})
 
 
 @pytest.fixture()
@@ -303,7 +303,7 @@ class TestPipelineConstruction:
     def test_custom_tau_respected(self, unet, vae, scheduler, tokenizer, text_encoder):
         from attn_texture.core.two_pass_pipeline import TwoPassPipeline
 
-        cfg = OmegaConf.create({"tau_f": 0.3, "tau_A": 0.6, "guidance_scale": 7.5, "fft_cutoff_ratio": 0.25})
+        cfg = OmegaConf.create({"tau_f": 0.3, "tau_A": 0.6, "guidance_scale": 7.5, "fft_cutoff_ratio": 0.25, "blend_weight": 0.5})
         p = TwoPassPipeline(unet, vae, scheduler, tokenizer, text_encoder, cfg)
         assert p.injector.tau_f == pytest.approx(0.3)
         assert p.injector.tau_A == pytest.approx(0.6)
@@ -513,7 +513,7 @@ class TestFFTBlend:
         """cutoff=0 short-circuits to gen luminance — pipeline still runs."""
         from attn_texture.core.two_pass_pipeline import TwoPassPipeline
 
-        cfg = OmegaConf.create({"tau_f": 0.8, "tau_A": 0.5, "guidance_scale": 7.5, "fft_cutoff_ratio": 0.0})
+        cfg = OmegaConf.create({"tau_f": 0.8, "tau_A": 0.5, "guidance_scale": 7.5, "fft_cutoff_ratio": 0.0, "blend_weight": 0.5})
         p = TwoPassPipeline(unet, vae, scheduler, tokenizer, text_encoder, cfg)
         assert p.fft_cutoff_ratio == pytest.approx(0.0)
 
@@ -521,7 +521,7 @@ class TestFFTBlend:
         """blend_images_lab must be invoked exactly once per run(), after VAE decode."""
         from unittest.mock import patch, MagicMock
 
-        sentinel = MagicMock(side_effect=lambda src, gen, cutoff_ratio: gen)
+        sentinel = MagicMock(side_effect=lambda src, gen, cutoff_ratio, blend_weight: gen)
         with patch("attn_texture.core.two_pass_pipeline.blend_images_lab", sentinel):
             _run(pipeline, source_image)
 
@@ -531,7 +531,7 @@ class TestFFTBlend:
         """The cutoff_ratio passed to blend_images_lab must match pipeline.fft_cutoff_ratio."""
         from unittest.mock import patch, MagicMock
 
-        sentinel = MagicMock(side_effect=lambda src, gen, cutoff_ratio: gen)
+        sentinel = MagicMock(side_effect=lambda src, gen, cutoff_ratio, blend_weight: gen)
         with patch("attn_texture.core.two_pass_pipeline.blend_images_lab", sentinel):
             _run(pipeline, source_image)
 
@@ -541,7 +541,7 @@ class TestFFTBlend:
         """src and gen passed to blend_images_lab must be 3-channel pixel tensors (not latents)."""
         from unittest.mock import patch, MagicMock
 
-        sentinel = MagicMock(side_effect=lambda src, gen, cutoff_ratio: gen)
+        sentinel = MagicMock(side_effect=lambda src, gen, cutoff_ratio, blend_weight: gen)
         with patch("attn_texture.core.two_pass_pipeline.blend_images_lab", sentinel):
             _run(pipeline, source_image)
 
@@ -550,3 +550,37 @@ class TestFFTBlend:
         assert kwargs["src"].shape[1] == 3   # RGB, not 4-ch latent
         assert kwargs["gen"].ndim == 4
         assert kwargs["gen"].shape[1] == 3   # RGB, not 4-ch latent
+
+    def test_match_ab_histogram_called_once(self, pipeline, source_image):
+        """match_ab_histogram must be called exactly once per run(), after blend_images_lab."""
+        from unittest.mock import patch, MagicMock
+
+        sentinel = MagicMock(side_effect=lambda blended, reference: blended)
+        with patch("attn_texture.core.two_pass_pipeline.match_ab_histogram", sentinel):
+            _run(pipeline, source_image)
+
+        assert sentinel.call_count == 1
+
+    def test_match_ab_histogram_receives_gen_raw_as_reference(self, pipeline, source_image):
+        """reference passed to match_ab_histogram must be gen_raw (the pre-blend decoded tensor)."""
+        from unittest.mock import patch, MagicMock
+
+        captured: dict = {}
+
+        def capture_blend(src, gen, cutoff_ratio, blend_weight):
+            captured["gen_raw"] = gen
+            return gen
+
+        def capture_match(blended, reference):
+            captured["reference"] = reference
+            return blended
+
+        with (
+            patch("attn_texture.core.two_pass_pipeline.blend_images_lab", side_effect=capture_blend),
+            patch("attn_texture.core.two_pass_pipeline.match_ab_histogram", side_effect=capture_match),
+        ):
+            _run(pipeline, source_image)
+
+        assert captured["gen_raw"] is captured["reference"], (
+            "reference passed to match_ab_histogram must be the same tensor as gen passed to blend_images_lab"
+        )

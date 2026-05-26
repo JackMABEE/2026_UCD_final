@@ -41,5 +41,5 @@ mask:
   aggregate_places:             # UNet blocks contributing to the mask (P2P §3.2)
     - "down"
     - "up"
-  threshold: 0.4                # binary threshold in [0, 1]; lower = larger mask
+  threshold: 0.3                # binary threshold in [0, 1]; lower = larger mask
   max_spatial_side: 32          # AttentionStore filter: retain maps ≤ this spatial side
